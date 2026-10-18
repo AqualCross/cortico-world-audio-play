@@ -1,0 +1,64 @@
+{
+  "name": "cortico-world-audio-play",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "音频播放（Audio Play）—— 给 Coopanion 桌宠的 cortico World 扩展：把 log:/mem: 音频句柄或本地音频文件交给系统扬声器播放，只回成功或失败。 / A cortico World extension that plays a log:/mem: audio handle or a local audio file through the system speakers and reports only the outcome.",
+  "license": "MIT",
+  "author": {
+    "name": "AqualCross"
+  },
+  "homepage": "https://github.com/AqualCross/cortico-world-audio-play#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AqualCross/cortico-world-audio-play.git"
+  },
+  "bugs": {
+    "url": "https://github.com/AqualCross/cortico-world-audio-play/issues"
+  },
+  "keywords": [
+    "cortico-world",
+    "cortico",
+    "coopanion",
+    "audio",
+    "audio-playback",
+    "play",
+    "speaker",
+    "playback",
+    "tts",
+    "voice",
+    "wav",
+    "mp3"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": [
+    "src",
+    "describe.json",
+    "CHANGELOG.md",
+    "README.md"
+  ],
+  "scripts": {
+    "selfcheck": "node tools/check.mjs",
+    "describe:extension": "node tools/describe.mjs",
+    "drymount": "node --experimental-transform-types tools/drymount.mts",
+    "smoke": "node tools/smoke.mjs",
+    "prepublishOnly": "node tools/check.mjs"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "cortico": {
+    "kind": "world",
+    "api": 6,
+    "displayName": "音频播放",
+    "tags": [
+      "voice"
+    ],
+    "describe": "describe.json"
+  }
+}

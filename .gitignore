@@ -1,0 +1,17 @@
+# 依赖 / 锁文件
+node_modules/
+pnpm-lock.yaml
+package-lock.json
+yarn.lock
+
+# 运行时产物
+scratch/
+*.tmp
+*.log
+.env
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

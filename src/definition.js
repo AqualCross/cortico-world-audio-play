@@ -1,0 +1,58 @@
+/**
+ * WorldDefinition：装配层在构造所有可用定义时也会跑 create()，
+ * 所以构造函数必须是纯的（不建目录、不启动播放器）。
+ */
+import { existsSync } from 'node:fs';
+
+import { DEFAULTS, ID, LABEL } from './config.js';
+import { playScriptPath, supportedPlatform } from './player.js';
+import { AUDIO_PLAY_TOOL_DECLS, AudioPlayWorld } from './world.js';
+
+/** 自描述里每个工具配一句给人看的话，按工具名。 */
+const TOOL_SUMMARIES = {
+  audio_play: {
+    zh: '把一段音频（本地文件或 log:/mem: 句柄，比如 tts_speak 回执里的那个）从本机扬声器播放出来；只回成功或失败。',
+    en: 'Play an audio file or a log:/mem: handle (such as the one returned by tts_speak) through the local speakers; reports only the outcome.',
+  },
+};
+
+/** 与框架 `describeTools()` 相同的拼法：取发给模型的字段，再加一句 summary。 */
+function describeTools(decls) {
+  return decls.map(({ name, description, parameters, tags }) => ({
+    name,
+    description,
+    parameters,
+    tags,
+    summary: TOOL_SUMMARIES[name],
+  }));
+}
+
+export const audioPlayDefinition = {
+  id: ID,
+  label: LABEL,
+  /** `worlds.audio-play` 段的默认值；启用与否由部署决定，定义里恒为 false。 */
+  defaults: () => structuredClone(DEFAULTS),
+  preflight: () => {
+    if (typeof AbortSignal?.any !== 'function') {
+      throw new Error('音频播放需要 Node 22+ 的 AbortSignal.any');
+    }
+    if (!supportedPlatform()) {
+      throw new Error(`音频播放不支持当前系统（${process.platform}）：Windows 用 WPF，macOS 用 afplay，Linux 用 ffplay / mpv / paplay / aplay。`);
+    }
+    if (process.platform === 'win32' && !existsSync(playScriptPath())) {
+      throw new Error('音频播放缺少 src/play.ps1：重新安装扩展后再试。');
+    }
+  },
+  create: (ctx) => new AudioPlayWorld({
+    cfg: ctx.cfg,
+    dataDir: ctx.dataDir,
+    botDir: ctx.botDir,
+  }),
+  /** 自描述：可能出现的全部工具与事件，不进提示词。`describe:extension` 把它导出成 describe.json。 */
+  describe: {
+    tools: describeTools(AUDIO_PLAY_TOOL_DECLS),
+    events: [],
+  },
+};
+
+export default audioPlayDefinition;
