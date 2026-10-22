@@ -64,8 +64,7 @@ pnpm add "D:\path\to\cortico-world-audio-play" --ignore-workspace
 并自己在 `extensions/package.json` 里加
 `"cortico-world-audio-play": "link:D:\\path\\to\\cortico-world-audio-play"`。
 
-**装完必须重启 Coopanion**：扩展是 ESM 模块，进程内不会重新加载。重启后在
-`config.json` 的 `worlds.audio-play.enabled` 上打开（控制台里也有这个开关），
+**装完必须重启 Coopanion**：扩展是 ESM 模块，进程内不会重新加载。重启后在 World 页启用本 World（写 `config.json` 的 `worlds.audio-play.enabled = true`），
 `audio_play` 才会挂给桌宠。
 
 ### 一份能用的 `worlds.audio-play` 长什么样
