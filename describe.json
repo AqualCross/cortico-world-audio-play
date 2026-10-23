@@ -28,6 +28,39 @@
         "zh": "把一段音频（本地文件或 log:/mem: 句柄，比如 tts_speak 回执里的那个）从本机扬声器播放出来；只回成功或失败。",
         "en": "Play an audio file or a log:/mem: handle (such as the one returned by tts_speak) through the local speakers; reports only the outcome."
       }
+    },
+    {
+      "name": "audio_watch",
+      "description": "Turn automatic playback of event audio on or off, change the watched event types, or read the current state. start watches events of the configured types (tts.voice by default) and plays new events that carry an audio attachment; stop ends watching; set changes the watched types without changing whether watching is on; status shows the settings and last playback. Every change is saved to the config.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "start",
+              "stop",
+              "set",
+              "status"
+            ],
+            "description": "start = watch new events and play their audio; stop = stop watching; set = change the watched types; status = show the current settings."
+          },
+          "events": {
+            "type": "string",
+            "description": "For start and set: comma-separated event types to watch, e.g. tts.voice. For start it defaults to the configured list."
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "tags": [
+        "act"
+      ],
+      "summary": {
+        "zh": "打开或关闭事件音频的自动播放，或查看当前监听的事件类型；播放新事件里的音频附件。",
+        "en": "Turn automatic playback of event audio on or off, or read the watched event types; plays audio attachments on new events."
+      }
     }
   ],
   "events": []

@@ -13,7 +13,17 @@ export const DEFAULTS = Object.freeze({
   enabled: false,
   volume: 80,
   timeoutMs: 120000,
+  autoPlay: false,
+  watchEvents: 'tts.voice',
 });
+
+/** `watchEvents` 的写法：逗号或空白分隔的事件类型。 */
+export function watchTypes(value) {
+  return [...new Set(String(value ?? '')
+    .split(/[,，\s]+/)
+    .map((s) => s.trim())
+    .filter(Boolean))];
+}
 
 const ZH = {
   label: '音频播放',
@@ -26,6 +36,10 @@ const ZH = {
     volumeDesc: '0–100；工具参数 volume 可临时覆盖。',
     timeout: '超时',
     timeoutDesc: '单次播放的等待上限；超过就停掉播放器并报失败。',
+    autoPlay: '自动播放事件音频',
+    autoPlayDesc: '监听事件库里的指定事件，把带音频附件的事件播放出来；只播打开之后的新事件，重启不补。桌宠也能用 audio_watch 开关。',
+    watchEvents: '监听事件类型',
+    watchEventsDesc: '逗号分隔的事件类型；默认 tts.voice（文本转语音的声音事件）。只挑带音频附件的事件。',
   },
 };
 
@@ -40,6 +54,10 @@ const EN = {
     volumeDesc: '0–100; the volume tool argument overrides it for one call.',
     timeout: 'Timeout',
     timeoutDesc: 'How long one playback may take; past it the player is stopped and the call fails.',
+    autoPlay: 'Play event audio',
+    autoPlayDesc: 'Watch the configured event types and play events that carry an audio attachment; only new events after this is enabled, nothing is replayed on restart. The pet can toggle it with audio_watch.',
+    watchEvents: 'Event types',
+    watchEventsDesc: 'Comma-separated event types; the default is tts.voice (the Text to Speech voice event). Only events with an audio attachment are played.',
   },
 };
 
@@ -77,6 +95,8 @@ export function configGroup(language = 'zh') {
           'x-suffix': 'ms',
           'x-hot': true,
         },
+        [`${K}.autoPlay`]: { type: 'boolean', title: t.autoPlay, description: t.autoPlayDesc, 'x-hot': true },
+        [`${K}.watchEvents`]: { type: 'string', title: t.watchEvents, description: t.watchEventsDesc, 'x-hot': true },
       },
     },
   };

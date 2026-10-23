@@ -14,6 +14,10 @@ const TOOL_SUMMARIES = {
     zh: '把一段音频（本地文件或 log:/mem: 句柄，比如 tts_speak 回执里的那个）从本机扬声器播放出来；只回成功或失败。',
     en: 'Play an audio file or a log:/mem: handle (such as the one returned by tts_speak) through the local speakers; reports only the outcome.',
   },
+  audio_watch: {
+    zh: '打开或关闭事件音频的自动播放，或查看当前监听的事件类型；播放新事件里的音频附件。',
+    en: 'Turn automatic playback of event audio on or off, or read the watched event types; plays audio attachments on new events.',
+  },
 };
 
 /** 与框架 `describeTools()` 相同的拼法：取发给模型的字段，再加一句 summary。 */
@@ -47,6 +51,7 @@ export const audioPlayDefinition = {
     cfg: ctx.cfg,
     dataDir: ctx.dataDir,
     botDir: ctx.botDir,
+    persist: typeof ctx.persist === 'function' ? (patch) => ctx.persist(patch) : undefined,
   }),
   /** 自描述：可能出现的全部工具与事件，不进提示词。`describe:extension` 把它导出成 describe.json。 */
   describe: {

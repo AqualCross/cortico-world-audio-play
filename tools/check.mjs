@@ -63,6 +63,7 @@ const { AudioPlayWorld } = mod;
 
 function makeWorld(overrides = {}, opts = {}) {
   const calls = [];
+  const persisted = [];
   const play = opts.play ?? (async () => ({ backend: 'fake' }));
   const dataDir = opts.dataDir ?? join(scratch, 'data');
   const botDir = opts.botDir ?? join(scratch, 'bot');
@@ -70,20 +71,43 @@ function makeWorld(overrides = {}, opts = {}) {
     cfg: { ...def.defaults(), enabled: true, ...overrides },
     dataDir,
     botDir,
+    persist: (patch) => persisted.push(structuredClone(patch)),
+    scanMs: opts.scanMs,
     playFile: async (one) => {
       calls.push(one);
       return play(one);
     },
   });
   world.__calls = calls;
+  world.__persisted = persisted;
   return world;
 }
 
-function fakeHost(blobs = {}) {
+function fakeHost(blobs = {}, events = []) {
+  const all = [...events];
   return {
     blob: (handle) => blobs[handle] ?? null,
+    store: {
+      latestCursor: () => (all.length ? all[all.length - 1].cursor : 0),
+      range: ({ fromCursor = 0, limit = 20 } = {}) => all.filter((one) => one.cursor >= fromCursor).slice(0, limit),
+    },
     log: { info: () => {}, warn: () => {}, child() { return this; } },
+    add(event) {
+      const full = { ...event, cursor: (all.length ? all[all.length - 1].cursor : 0) + 1 };
+      all.push(full);
+      return full;
+    },
   };
+}
+
+/** Waits until `check` holds, or fails the check. */
+async function until(check, timeoutMs = 2500) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (check()) return;
+    await new Promise((done) => setTimeout(done, 15));
+  }
+  throw new Error('condition never held');
 }
 
 function writeFile(path, bytes = Buffer.from('fake-audio-bytes')) {
@@ -124,11 +148,13 @@ try {
     eq(defaults.enabled, false, 'enabled 默认 false');
     eq(defaults.volume, 80, 'volume 默认');
     eq(defaults.timeoutMs, 120000, 'timeoutMs 默认');
+    eq(defaults.autoPlay, false, 'autoPlay 默认');
+    eq(defaults.watchEvents, 'tts.voice', 'watchEvents 默认');
     def.preflight(); // 当前平台满足时不抛
   });
 
   check('describe 与 describe.json 一致，实例工具都在声明里', () => {
-    assert(def.describe && Array.isArray(def.describe.tools) && def.describe.tools.length === 1, '定义缺 describe.tools');
+    assert(def.describe && Array.isArray(def.describe.tools) && def.describe.tools.length === 2, '定义缺 describe.tools');
     assert(Array.isArray(def.describe.events), '定义缺 describe.events');
     const file = JSON.parse(readFileSync(join(pkgDir, 'describe.json'), 'utf8'));
     eq(stable(file), stable(JSON.parse(JSON.stringify(def.describe))), 'describe.json 与代码里的 describe 不一致');
@@ -168,10 +194,10 @@ try {
   // -------------------------------------------------------------------------
   console.log('World 与工具');
 
-  check('工具只有一个 audio_play，声明齐全', () => {
+  check('audio_play 与 audio_watch，声明齐全', () => {
     const world = makeWorld();
     const tools = world.tools();
-    eq(tools.length, 1, '工具数量');
+    eq(tools.length, 2, '工具数量');
     const tool = tools[0];
     eq(tool.name, 'audio_play', '工具名');
     assert(Array.isArray(tool.tags) && tool.tags.includes('act'), 'tags');
@@ -179,6 +205,10 @@ try {
     eq(tool.parameters.required?.[0], 'audio', 'required[0]');
     assert(tool.parameters.properties?.audio, '缺 audio 参数');
     assert(tool.parameters.properties?.volume, '缺 volume 参数');
+    const watch = tools[1];
+    eq(watch.name, 'audio_watch', '监听工具名');
+    eq(watch.parameters.required?.[0], 'action', 'watch required[0]');
+    assert(watch.parameters.properties?.events, '缺 events 参数');
   });
 
   check('播放器工具函数与平台声明', () => {
@@ -266,6 +296,77 @@ try {
     assert(handle.failed && handle.text.includes('解析不出来'), handle.text);
     const missing = await world.tools()[0].handler({ audio: 'nope.wav' }, {});
     assert(missing.failed && missing.text.includes('找不到音频文件'), missing.text);
+    await world.stop();
+  });
+
+  // -------------------------------------------------------------------------
+  console.log('事件监听');
+
+  await checkAsync('audio_watch 开关与监听类型落盘', async () => {
+    const world = makeWorld();
+    const watch = world.tools()[1];
+    const status = await watch.handler({ action: 'status' }, {});
+    assert(status.text.includes('off') && status.text.includes('tts.voice'), status.text);
+    const started = await watch.handler({ action: 'start', events: 'tts.voice, listen.chunk' }, {});
+    assert(!started.failed, started.text);
+    eq(world.cfg.autoPlay, true, 'autoPlay');
+    eq(world.cfg.watchEvents, 'tts.voice, listen.chunk', 'watchEvents');
+    eq(JSON.stringify(world.__persisted[0]), JSON.stringify({ autoPlay: true, watchEvents: 'tts.voice, listen.chunk' }), 'persist patch');
+    const stopped = await watch.handler({ action: 'stop' }, {});
+    assert(!stopped.failed, stopped.text);
+    eq(world.cfg.autoPlay, false, 'stop');
+    const set = await watch.handler({ action: 'set', events: 'tts.voice' }, {});
+    assert(!set.failed, set.text);
+    eq(world.cfg.watchEvents, 'tts.voice', 'set events');
+    eq(world.cfg.autoPlay, false, 'set 不该打开自动播放');
+    const missing = await watch.handler({ action: 'set' }, {});
+    assert(missing.failed, 'set 不给 events 应当失败');
+  });
+
+  await checkAsync('自动监听事件并播放音频；启动前的旧事件与非音频事件不播', async () => {
+    const bytes = Buffer.from('watched-wav');
+    const handle = 'log:watched.wav';
+    const host = fakeHost({ [handle]: { bytes, mime: 'audio/wav' } }, [{
+      cursor: 1,
+      type: 'tts.voice',
+      source: 'tts',
+      blobs: [{ handle, mime: 'audio/wav' }],
+    }]);
+    const world = makeWorld({ autoPlay: true }, { scanMs: 15, dataDir: join(scratch, 'watch-data') });
+    await world.start(host);
+    await new Promise((done) => setTimeout(done, 50));
+    eq(world.__calls.length, 0, '启动前的旧事件不该播');
+
+    host.add({ type: 'tts.voice', source: 'tts', blobs: [{ handle, mime: 'audio/wav' }] });
+    host.add({ type: 'other.audio', source: 'other', blobs: [{ handle, mime: 'audio/wav' }] });
+    host.add({ type: 'tts.voice', source: 'tts' });
+    await until(() => world.__calls.length >= 1);
+    await new Promise((done) => setTimeout(done, 60));
+    eq(world.__calls.length, 1, '只播匹配且有音频的一条');
+    assert(world.__calls[0].path.endsWith('.wav'), `临时文件扩展名不对：${world.__calls[0].path}`);
+    assert(!existsSync(world.__calls[0].path), '临时文件应当已删除');
+    eq(world.__calls[0].volume, 80, '配置音量');
+    await world.stop();
+  });
+
+  await checkAsync('打开监听只播之后的新事件，stop 后不再播', async () => {
+    const file = writeFile(join(scratch, 'watched-path.wav'));
+    const host = fakeHost();
+    const world = makeWorld({ autoPlay: false }, { scanMs: 15, dataDir: join(scratch, 'watch-data-2') });
+    await world.start(host);
+    host.add({ type: 'tts.voice', source: 'tts', meta: { path: file } });
+    await new Promise((done) => setTimeout(done, 50));
+    eq(world.__calls.length, 0, '关着自动播放时不该播');
+
+    await world.tools()[1].handler({ action: 'start' }, {});
+    host.add({ type: 'tts.voice', source: 'tts', meta: { path: file } });
+    await until(() => world.__calls.length >= 1);
+    eq(world.__calls[0].path, file, '按事件里的路径播放');
+
+    await world.tools()[1].handler({ action: 'stop' }, {});
+    host.add({ type: 'tts.voice', source: 'tts', meta: { path: file } });
+    await new Promise((done) => setTimeout(done, 60));
+    eq(world.__calls.length, 1, 'stop 之后不该再播');
     await world.stop();
   });
 

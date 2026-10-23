@@ -14,11 +14,12 @@
 
 ## 它做了什么
 
-装好并启用之后，桌宠会多出一个工具：
+装好并启用之后，桌宠会多出两个工具：
 
 | 工具 | 标签 | 作用 |
 | --- | --- | --- |
 | `audio_play` | `act` | 播放一个本地音频文件或 `log:` / `mem:` 句柄；等它放完，只回成功/失败 |
+| `audio_watch` | `act` | 打开/关闭事件音频的自动播放、更换监听的事件类型，或查看状态 |
 
 参数：
 
@@ -39,6 +40,8 @@
 ```text
 [audio_play 失败] 找不到音频文件：nope.wav（相对路径先按 bot 目录的 workspace/、再按 bot 目录、最后按插件数据目录找）
 ```
+
+`audio_watch` 的 `action` 是 `start` / `stop` / `set` / `status`；`events` 用逗号分隔事件类型（默认 `tts.voice`）。`start` 之后本扩展自己监听并播放，不需要模型再调 `audio_play`。
 
 ## 安装
 
@@ -95,8 +98,10 @@ pnpm add "D:\path\to\cortico-world-audio-play" --ignore-workspace
 | `enabled` | `false` | 是否把 `audio_play` 挂给桌宠 |
 | `volume` | `80` | 默认音量 0–100；工具参数 `volume` 可临时覆盖 |
 | `timeoutMs` | `120000` | 单次播放的等待上限；超过就停掉播放器并报失败 |
+| `autoPlay` | `false` | 监听事件库，把指定事件里的音频自动播放；只播打开之后的新事件 |
+| `watchEvents` | `tts.voice` | 要监听的事件类型，逗号分隔；默认是 `cortico-world-tts` 的声音事件 |
 
-不需要密钥，也没有 `.env` 配置。
+不需要密钥，也没有 `.env` 配置。`autoPlay` 与 `watchEvents` 也能由桌宠用 `audio_watch` 修改。
 
 ## 它怎么出声
 
@@ -151,6 +156,17 @@ Windows 的 PowerShell 脚本退出码会翻成中文提示：
 ```json
 { "audio": "log:xxxxxxxxxxxxxxxx.wav", "volume": 60 }
 ```
+
+如果 TTS 用 `delivery: event` 或开启了 `autoSpeak`，不用手动交接：打开下面的 `autoPlay`，声音事件会被自动播放。
+
+## 监听事件音频
+
+`autoPlay: true` 后，本扩展每秒扫一次事件库，把 `watchEvents` 里列出的、带音频附件的新事件依次播放。它只播打开监听之后的事件；重启、关闭再打开都不补播旧事件。
+
+- `watchEvents` 默认 `tts.voice`，也就是 `cortico-world-tts` 的声音事件；多个事件类型用逗号分隔。事件类型按扩展命名，别的扩展发音频事件时填它的事件名。
+- 音频优先取事件附件句柄，其次取事件 `meta.path`（TTS 的声音事件两者都有）；和 `audio_play` 共用同一条播放队列。
+- 桌宠可以用 `audio_watch` 控制：`start` / `stop` / `set`（只换监听类型）/ `status`，改动会写进配置。
+- 播放失败只写日志与状态，不会推事件或回执；成功不阻塞对话。
 
 ## 控制台页
 

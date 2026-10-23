@@ -12,7 +12,7 @@ import { mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs
 import { basename, extname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { DEFAULTS, ID, configGroup, text } from './config.js';
+import { DEFAULTS, ID, configGroup, text, watchTypes } from './config.js';
 import { PlaybackError, backendLabel, playFile, supportedPlatform } from './player.js';
 
 const msg = (err) => (err instanceof Error ? err.message : String(err));
@@ -59,6 +59,19 @@ export const AUDIO_PLAY_TOOL_DECLS = [
       required: ['audio'],
     },
   },
+  {
+    name: 'audio_watch',
+    tags: ['act'],
+    description: 'Turn automatic playback of event audio on or off, change the watched event types, or read the current state. start watches events of the configured types (tts.voice by default) and plays new events that carry an audio attachment; stop ends watching; set changes the watched types without changing whether watching is on; status shows the settings and last playback. Every change is saved to the config.',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['start', 'stop', 'set', 'status'], description: 'start = watch new events and play their audio; stop = stop watching; set = change the watched types; status = show the current settings.' },
+        events: { type: 'string', description: 'For start and set: comma-separated event types to watch, e.g. tts.voice. For start it defaults to the configured list.' },
+      },
+      required: ['action'],
+    },
+  },
 ];
 
 function formatBytes(value) {
@@ -82,6 +95,11 @@ export class AudioPlayWorld {
   #stopped = false;
   #lastError = '';
   #lastPlayedAt = '';
+  #persist = null;
+  #scanMs;
+  #timer = null;
+  #watchCursor = 0;
+  #lastWatched = '';
 
   constructor(opts = {}) {
     this.id = ID;
@@ -90,6 +108,8 @@ export class AudioPlayWorld {
     this.botDir = opts.botDir ?? process.cwd();
     this.language = 'zh';
     this.playFile = typeof opts.playFile === 'function' ? opts.playFile : playFile;
+    this.#persist = typeof opts.persist === 'function' ? opts.persist : null;
+    this.#scanMs = Number.isFinite(Number(opts.scanMs)) && Number(opts.scanMs) >= 10 ? Number(opts.scanMs) : 1000;
   }
 
   // -------------------------------------------------------------------------
@@ -105,6 +125,11 @@ export class AudioPlayWorld {
     const n = Number(this.#raw(key));
     if (!Number.isFinite(n)) return Number(DEFAULTS[key]) || min;
     return Math.min(Math.max(n, min), max);
+  }
+
+  #bool(key) {
+    const value = this.#raw(key);
+    return typeof value === 'boolean' ? value : Boolean(DEFAULTS[key]);
   }
 
   #volume(args) {
@@ -143,10 +168,142 @@ export class AudioPlayWorld {
   // -------------------------------------------------------------------------
 
   tools() {
-    return [{
-      ...AUDIO_PLAY_TOOL_DECLS[0],
-      handler: (args, ctx) => this.#enqueue(() => this.#play(args ?? {}, ctx)),
-    }];
+    return [
+      { ...AUDIO_PLAY_TOOL_DECLS[0], handler: (args, ctx) => this.#enqueue(() => this.#play(args ?? {}, ctx)) },
+      { ...AUDIO_PLAY_TOOL_DECLS[1], handler: async (args) => this.#watchAction(args ?? {}) },
+    ];
+  }
+
+  /** 当前要监听的事件类型；空集合表示不播。 */
+  #watchTypes() {
+    return new Set(watchTypes(this.#raw('watchEvents')));
+  }
+
+  #watchSays() {
+    const types = watchTypes(this.#raw('watchEvents'));
+    const auto = this.#bool('autoPlay') ? 'on' : 'off';
+    const bits = [`自动播放：${auto}`, `监听：${types.join(', ') || '（空）'}`];
+    if (this.#busy) bits.push(`在途 ${this.#busy}`);
+    if (this.#lastWatched) bits.push(`上次：${this.#lastWatched}`);
+    return bits.join(' · ');
+  }
+
+  /** 改监听相关配置；写盘失败只回报，不改内存。 */
+  #applyConfig(patch) {
+    try {
+      this.#persist?.(patch);
+    } catch (err) {
+      return `配置没写进去：${msg(err)}`;
+    }
+    for (const [key, value] of Object.entries(patch)) this.cfg[key] = value;
+    return '';
+  }
+
+  #watchAction(args) {
+    const action = asText(args.action) || 'status';
+    if (action === 'status') return { text: this.#watchSays() };
+    if (action !== 'start' && action !== 'stop' && action !== 'set') {
+      return { text: '[audio_watch 没执行] action 只能是 start、stop、set 或 status。', failed: true };
+    }
+    const patch = action === 'set' ? {} : { autoPlay: action === 'start' };
+    if (action !== 'stop' && args.events !== undefined) {
+      const types = watchTypes(args.events);
+      if (!types.length) return { text: '[audio_watch 没执行] events 至少要有一个事件类型。', failed: true };
+      patch.watchEvents = types.join(', ');
+    }
+    if (action === 'set' && patch.watchEvents === undefined) {
+      return { text: '[audio_watch 没执行] set 需要给 events。', failed: true };
+    }
+    const error = this.#applyConfig(patch);
+    if (error) return { text: `[audio_watch 失败] ${error}`, failed: true };
+    // 打开、关上或换监听列表都不补播旧事件：游标从现在开始。
+    this.#watchCursor = this.#host?.store?.latestCursor?.() ?? this.#watchCursor;
+    const verb = action === 'start' ? '开始监听' : action === 'stop' ? '停止监听' : '已更新监听';
+    return { text: `${verb}；${this.#watchSays()}` };
+  }
+
+  /** 扫一遍事件库；关着自动播放时只把游标推到最新。 */
+  #scanWatched() {
+    const host = this.#host;
+    if (!host) return;
+    try {
+      if (!this.#bool('autoPlay')) {
+        this.#watchCursor = host.store.latestCursor();
+        return;
+      }
+      const types = this.#watchTypes();
+      if (!types.size) {
+        this.#watchCursor = host.store.latestCursor();
+        return;
+      }
+      const events = host.store.range({ fromCursor: this.#watchCursor + 1, limit: 20 });
+      for (const event of events) {
+        this.#watchCursor = Math.max(this.#watchCursor, event.cursor);
+        if (!types.has(event.type)) continue;
+        const ref = this.#audioRefOf(event);
+        if (!ref) continue;
+        void this.#enqueue(() => this.#playWatched(event, ref));
+      }
+    } catch (err) {
+      this.#lastError = `${new Date().toISOString()} 读事件失败：${msg(err)}`;
+    }
+  }
+
+  /** 事件里的音频：优先取音频附件句柄，其次取正文里写的路径。 */
+  #audioRefOf(event) {
+    const blobs = Array.isArray(event.blobs) ? event.blobs : [];
+    const blob = blobs.find((one) => one
+      && (/^audio\//i.test(String(one.mime ?? '')) || AUDIO_EXT.has(extensionOf(one.name, one.mime))));
+    if (blob?.handle) return { ref: blob.handle, temp: true };
+    const path = typeof event.meta?.path === 'string' ? event.meta.path.trim() : '';
+    if (path) return { ref: path, temp: false };
+    return null;
+  }
+
+  async #playWatched(event, ref) {
+    // 排队期间关掉监听、或 World 停了：这条不再播。
+    if (this.#stopped || !this.#bool('autoPlay')) return;
+    let audio;
+    try {
+      audio = this.#resolveAudio(ref.ref);
+    } catch (err) {
+      const fallback = ref.temp && typeof event.meta?.path === 'string' ? event.meta.path.trim() : '';
+      if (fallback) {
+        try {
+          audio = this.#resolveAudio(fallback);
+        } catch {
+          audio = null;
+        }
+      }
+      if (!audio) {
+        this.#failText(err, event.type);
+        return;
+      }
+    }
+    if (this.#stopped || !this.#bool('autoPlay')) {
+      if (audio.temp) this.#removeTemp(audio.path);
+      return;
+    }
+    const own = new AbortController();
+    this.#active.add(own);
+    this.#busy += 1;
+    try {
+      await this.playFile({ path: audio.path, volume: this.#volume({}), timeoutMs: this.#timeout(), signal: own.signal });
+      this.#lastPlayedAt = new Date().toISOString();
+      this.#lastWatched = event.type;
+    } catch (err) {
+      this.#failText(err, event.type);
+    } finally {
+      this.#busy -= 1;
+      this.#active.delete(own);
+      if (audio.temp) this.#removeTemp(audio.path);
+    }
+  }
+
+  #failText(err, type = '') {
+    const detail = err instanceof PlaybackError ? err.message : msg(err);
+    this.#lastError = `${new Date().toISOString()} ${detail}`;
+    this.#host?.log?.warn?.('自动播放失败', { err: detail, type });
   }
 
   /** 同一时间只放一段；后到的调用排队，避免两段声音叠在一起。 */
@@ -336,6 +493,9 @@ export class AudioPlayWorld {
       timeoutMs: this.#timeout(),
       lastError: this.#lastError,
       lastPlayedAt: this.#lastPlayedAt,
+      lastWatched: this.#lastWatched,
+      autoPlay: this.#bool('autoPlay'),
+      watchEvents: watchTypes(this.#raw('watchEvents')).join(', '),
     };
   }
 
@@ -370,6 +530,10 @@ export class AudioPlayWorld {
   async start(host) {
     this.#host = host;
     this.#stopped = false;
+    if (this.#timer) clearInterval(this.#timer);
+    this.#watchCursor = host.store.latestCursor();
+    this.#timer = setInterval(() => this.#scanWatched(), this.#scanMs);
+    this.#timer.unref?.();
     try {
       mkdirSync(this.tempDir(), { recursive: true });
       this.#cleanTemp();
@@ -380,11 +544,17 @@ export class AudioPlayWorld {
       backend: backendLabel(process.platform),
       volume: this.#volume({}),
       tempDir: this.tempDir(),
+      autoPlay: this.#bool('autoPlay'),
+      watchEvents: watchTypes(this.#raw('watchEvents')).join(', '),
     });
   }
 
   async stop() {
     this.#stopped = true;
+    if (this.#timer) {
+      clearInterval(this.#timer);
+      this.#timer = null;
+    }
     for (const own of this.#active) own.abort();
     this.#active.clear();
     this.#host = null;

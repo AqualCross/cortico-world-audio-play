@@ -1,8 +1,8 @@
 {
   "name": "cortico-world-audio-play",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
-  "description": "音频播放（Audio Play）—— 给 Coopanion 桌宠的 cortico World 扩展：把 log:/mem: 音频句柄或本地音频文件交给系统扬声器播放，只回成功或失败。 / A cortico World extension that plays a log:/mem: audio handle or a local audio file through the system speakers and reports only the outcome.",
+  "description": "音频播放（Audio Play）—— 给 Coopanion 桌宠的 cortico World 扩展：把 log:/mem: 音频句柄或本地音频文件交给系统扬声器播放，只回成功或失败；也可以监听其他扩展的声音事件自动播放。 / A cortico World extension that plays a log:/mem: audio handle or a local audio file through the system speakers and reports only the outcome; it can also watch voice events from other extensions and play their audio automatically.",
   "license": "MIT",
   "author": {
     "name": "AqualCross"
