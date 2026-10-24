@@ -1,8 +1,8 @@
 /**
  * 音频播放 World。
  *
- * 只做一件事：把工具参数里的音频（本地路径，或 log:/mem: 句柄）交给系统播放器，
- * 等它放完，然后回一句成功或失败。这里不合成、不发送、也不保存音频。
+ * 只做一件事：把工具参数里的音频（本地路径，或 log:/mem: 句柄）交给本机播放器，
+ * 开始播放后立刻返回；失败发事件，成功不回报。这里不合成、不发送、也不保存音频。
  *
  * 句柄来自对话附件或工作区，Core 已经会解析；需要文件路径才能交给播放器，
  * 所以句柄会先落成临时文件，播放结束就删掉。
@@ -13,7 +13,13 @@ import { basename, extname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { DEFAULTS, ID, configGroup, text, watchTypes } from './config.js';
-import { PlaybackError, backendLabel, playFile, supportedPlatform } from './player.js';
+import {
+  AUDIO_PLAY_BACKENDS,
+  PlaybackError,
+  backendLabel,
+  playFile,
+  supportedPlatform,
+} from './player.js';
 
 const msg = (err) => (err instanceof Error ? err.message : String(err));
 const asText = (value) => (typeof value === 'string' ? value.trim() : '');
@@ -42,6 +48,13 @@ const AUDIO_EXT = new Set([
 ]);
 
 const TEMP_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const ENV_PROMPT = fileURLToPath(new URL('./ENV_PROMPT.md', import.meta.url));
+
+/** 播放失败事件；成功不发事件。 */
+export const AUDIO_PLAY_FAILED_EVENT = 'audio-play.failed';
+
+/** 自动播放连续失败时，失败事件至少隔这么久再发一次，避免事件潮。 */
+const AUTO_FAILURE_EVENT_MS = 30000;
 
 /** 全部工具的声明（不含 handler）；定义里的 describe 与 `tools()` 都取它。 */
 export const AUDIO_PLAY_TOOL_DECLS = [
@@ -49,7 +62,7 @@ export const AUDIO_PLAY_TOOL_DECLS = [
     name: 'audio_play',
     tags: ['act'],
     interruptible: true,
-    description: 'Play an audio file through the local speakers and wait until playback finishes. The audio comes from a local file path or a log:/mem: handle, such as the path or handle returned by tts_speak. It only plays sound; it does not send anything.',
+    description: 'Start playing an audio file through the local speakers and return at once. The audio comes from a local file path or a log:/mem: handle, such as the path or handle returned by tts_speak. It only plays sound; it does not send anything. A playback failure arrives later as an audio-play.failed event.',
     parameters: {
       type: 'object',
       properties: {
@@ -62,24 +75,18 @@ export const AUDIO_PLAY_TOOL_DECLS = [
   {
     name: 'audio_watch',
     tags: ['act'],
-    description: 'Turn automatic playback of event audio on or off, change the watched event types, or read the current state. start watches events of the configured types (tts.voice by default) and plays new events that carry an audio attachment; stop ends watching; set changes the watched types without changing whether watching is on; status shows the settings and last playback. Every change is saved to the config.',
+    description: 'Read or change playback settings. start turns on automatic playback of event audio for the configured event types (tts.voice by default) and plays new events that carry an audio attachment; stop turns it off; set changes the watched event types and/or the playback backend without changing whether watching is on; status shows the settings and last playback. Every change is saved to the config. Playback failures arrive as audio-play.failed events; success is silent.',
     parameters: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['start', 'stop', 'set', 'status'], description: 'start = watch new events and play their audio; stop = stop watching; set = change the watched types; status = show the current settings.' },
+        action: { type: 'string', enum: ['start', 'stop', 'set', 'status'], description: 'start = watch new events and play their audio; stop = stop watching; set = change the watched types and/or the playback backend; status = show the current settings.' },
         events: { type: 'string', description: 'For start and set: comma-separated event types to watch, e.g. tts.voice. For start it defaults to the configured list.' },
+        backend: { type: 'string', enum: [...AUDIO_PLAY_BACKENDS], description: 'For start and set: the playback backend. auto = platform default; wpf = Windows system player; ffplay, mpv, vlc, afplay, paplay, aplay = that command; custom = the command configured in the settings.' },
       },
       required: ['action'],
     },
   },
 ];
-
-function formatBytes(value) {
-  const n = Number(value);
-  if (!Number.isFinite(n) || n <= 0) return '大小未知';
-  if (n >= 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
-  return `${(n / 1024).toFixed(1)} KB`;
-}
 
 function extensionOf(name, mime) {
   const fromName = extname(String(name ?? '')).replace(/^\./, '').toLowerCase();
@@ -91,8 +98,10 @@ export class AudioPlayWorld {
   #host = null;
   #active = new Set();
   #tail = Promise.resolve();
+  #queued = 0;
   #busy = 0;
   #stopped = false;
+  #lastAutoFailureAt = 0;
   #lastError = '';
   #lastPlayedAt = '';
   #persist = null;
@@ -145,6 +154,18 @@ export class AudioPlayWorld {
     return Math.round(this.#num('timeoutMs', 5000, 900000));
   }
 
+  #backend() {
+    return String(this.#raw('backend') ?? 'auto').trim().toLowerCase() || 'auto';
+  }
+
+  #command() {
+    return asText(this.#raw('command'));
+  }
+
+  #backendSays() {
+    return backendLabel(process.platform, this.#backend());
+  }
+
   #text() {
     return text(this.language);
   }
@@ -158,9 +179,9 @@ export class AudioPlayWorld {
   // 提示词
   // -------------------------------------------------------------------------
 
-  /** 不往系统前缀里加任何东西：工具自身的描述就够了。 */
+  /** 提示词模板默认是空的；工具自身的描述就够了，部署者可以在提示词页补充。 */
   envPromptVars() {
-    return null;
+    return {};
   }
 
   // -------------------------------------------------------------------------
@@ -169,7 +190,7 @@ export class AudioPlayWorld {
 
   tools() {
     return [
-      { ...AUDIO_PLAY_TOOL_DECLS[0], handler: (args, ctx) => this.#enqueue(() => this.#play(args ?? {}, ctx)) },
+      { ...AUDIO_PLAY_TOOL_DECLS[0], handler: (args, ctx) => this.#play(args ?? {}, ctx) },
       { ...AUDIO_PLAY_TOOL_DECLS[1], handler: async (args) => this.#watchAction(args ?? {}) },
     ];
   }
@@ -182,7 +203,8 @@ export class AudioPlayWorld {
   #watchSays() {
     const types = watchTypes(this.#raw('watchEvents'));
     const auto = this.#bool('autoPlay') ? 'on' : 'off';
-    const bits = [`自动播放：${auto}`, `监听：${types.join(', ') || '（空）'}`];
+    const bits = [`自动播放：${auto}`, `监听：${types.join(', ') || '（空）'}`, `后端：${this.#backendSays()}`];
+    if (this.#backend() === 'custom') bits.push(`命令：${this.#command() || '（未配置）'}`);
     if (this.#busy) bits.push(`在途 ${this.#busy}`);
     if (this.#lastWatched) bits.push(`上次：${this.#lastWatched}`);
     return bits.join(' · ');
@@ -205,20 +227,34 @@ export class AudioPlayWorld {
     if (action !== 'start' && action !== 'stop' && action !== 'set') {
       return { text: '[audio_watch 没执行] action 只能是 start、stop、set 或 status。', failed: true };
     }
+    if (action === 'stop' && args.backend !== undefined) {
+      return { text: '[audio_watch 没执行] stop 只停止监听；换播放后端用 set。', failed: true };
+    }
     const patch = action === 'set' ? {} : { autoPlay: action === 'start' };
     if (action !== 'stop' && args.events !== undefined) {
       const types = watchTypes(args.events);
       if (!types.length) return { text: '[audio_watch 没执行] events 至少要有一个事件类型。', failed: true };
       patch.watchEvents = types.join(', ');
     }
-    if (action === 'set' && patch.watchEvents === undefined) {
-      return { text: '[audio_watch 没执行] set 需要给 events。', failed: true };
+    if (action !== 'stop' && args.backend !== undefined) {
+      const backend = asText(args.backend).toLowerCase();
+      if (!AUDIO_PLAY_BACKENDS.includes(backend)) {
+        return { text: `[audio_watch 没执行] backend 只能是 ${AUDIO_PLAY_BACKENDS.join(' / ')}。`, failed: true };
+      }
+      patch.backend = backend;
+    }
+    if (action === 'set' && Object.keys(patch).length === 0) {
+      return { text: '[audio_watch 没执行] set 需要给 events 或 backend。', failed: true };
     }
     const error = this.#applyConfig(patch);
     if (error) return { text: `[audio_watch 失败] ${error}`, failed: true };
+    // 换后端或重新打开监听后，下一次失败应当重新通知。
+    if (patch.autoPlay === true || 'backend' in patch) this.#lastAutoFailureAt = 0;
     // 打开、关上或换监听列表都不补播旧事件：游标从现在开始。
-    this.#watchCursor = this.#host?.store?.latestCursor?.() ?? this.#watchCursor;
-    const verb = action === 'start' ? '开始监听' : action === 'stop' ? '停止监听' : '已更新监听';
+    if ('autoPlay' in patch || 'watchEvents' in patch) {
+      this.#watchCursor = this.#host?.store?.latestCursor?.() ?? this.#watchCursor;
+    }
+    const verb = action === 'start' ? '开始监听' : action === 'stop' ? '停止监听' : '已更新设置';
     return { text: `${verb}；${this.#watchSays()}` };
   }
 
@@ -242,7 +278,8 @@ export class AudioPlayWorld {
         if (!types.has(event.type)) continue;
         const ref = this.#audioRefOf(event);
         if (!ref) continue;
-        void this.#enqueue(() => this.#playWatched(event, ref));
+        void this.#enqueue(() => this.#playWatched(event, ref))
+          .catch((err) => this.#host?.log?.warn?.('自动播放：后台任务异常', { err: msg(err) }));
       }
     } catch (err) {
       this.#lastError = `${new Date().toISOString()} 读事件失败：${msg(err)}`;
@@ -263,6 +300,7 @@ export class AudioPlayWorld {
   async #playWatched(event, ref) {
     // 排队期间关掉监听、或 World 停了：这条不再播。
     if (this.#stopped || !this.#bool('autoPlay')) return;
+    const volume = this.#volume({});
     let audio;
     try {
       audio = this.#resolveAudio(ref.ref);
@@ -276,7 +314,7 @@ export class AudioPlayWorld {
         }
       }
       if (!audio) {
-        this.#failText(err, event.type);
+        await this.#reportFailure(err, { origin: 'event', ref: ref.ref, type: event.type, volume });
         return;
       }
     }
@@ -288,11 +326,18 @@ export class AudioPlayWorld {
     this.#active.add(own);
     this.#busy += 1;
     try {
-      await this.playFile({ path: audio.path, volume: this.#volume({}), timeoutMs: this.#timeout(), signal: own.signal });
+      await this.playFile({
+        path: audio.path,
+        volume,
+        timeoutMs: this.#timeout(),
+        backend: this.#backend(),
+        command: this.#command(),
+        signal: own.signal,
+      });
       this.#lastPlayedAt = new Date().toISOString();
       this.#lastWatched = event.type;
     } catch (err) {
-      this.#failText(err, event.type);
+      await this.#reportFailure(err, { origin: 'event', ref: ref.ref, type: event.type, volume });
     } finally {
       this.#busy -= 1;
       this.#active.delete(own);
@@ -300,21 +345,24 @@ export class AudioPlayWorld {
     }
   }
 
-  #failText(err, type = '') {
-    const detail = err instanceof PlaybackError ? err.message : msg(err);
-    this.#lastError = `${new Date().toISOString()} ${detail}`;
-    this.#host?.log?.warn?.('自动播放失败', { err: detail, type });
-  }
-
   /** 同一时间只放一段；后到的调用排队，避免两段声音叠在一起。 */
   #enqueue(task) {
-    const run = () => task();
+    this.#queued += 1;
+    const run = () => {
+      this.#queued -= 1;
+      return task();
+    };
     const result = this.#tail.then(run, run);
     this.#tail = result.then(() => {}, () => {});
     return result;
   }
 
-  async #play(args, ctx) {
+  /** 等当前队列（正在播放和排队中）全部结束；自检与 smoke 用。 */
+  whenIdle() {
+    return this.#tail;
+  }
+
+  #play(args, ctx) {
     if (this.#stopped) {
       return { text: '[audio_play 没执行] 音频播放已停止；等 World 重新启用后再试。', failed: true };
     }
@@ -326,37 +374,97 @@ export class AudioPlayWorld {
       };
     }
 
-    let audio;
-    try {
-      audio = this.#resolveAudio(raw);
-    } catch (err) {
-      return this.#failure(err);
-    }
-
     const volume = this.#volume(args);
     const timeoutMs = this.#timeout();
     const own = new AbortController();
     this.#active.add(own);
     const signal = ctx?.signal ? AbortSignal.any([ctx.signal, own.signal]) : own.signal;
+    void this.#enqueue(() => this.#runPlay({ raw, volume, timeoutMs, signal, own }))
+      .catch((err) => this.#host?.log?.warn?.('音频播放：后台任务异常', { err: msg(err) }));
+
+    const behind = Math.max(0, this.#busy + this.#queued - 1);
+    const shown = /^(log|mem|file):/i.test(raw) ? raw : basename(raw);
+    const head = behind > 0 ? `已排队（前面还有 ${behind} 条）` : '开始播放';
+    return { text: `${head}：${shown}（音量 ${volume}）；放完不再回报，失败会以事件通知。` };
+  }
+
+  /** 后台播放：解析音频、等播放器结束、清临时文件；失败推事件。 */
+  async #runPlay({ raw, volume, timeoutMs, signal, own }) {
+    if (this.#stopped || signal.aborted) {
+      this.#active.delete(own);
+      return;
+    }
+    let audio = null;
     this.#busy += 1;
     try {
-      await this.playFile({ path: audio.path, volume, timeoutMs, signal });
+      audio = this.#resolveAudio(raw);
+      await this.playFile({
+        path: audio.path,
+        volume,
+        timeoutMs,
+        backend: this.#backend(),
+        command: this.#command(),
+        signal,
+      });
       this.#lastPlayedAt = new Date().toISOString();
-      return this.#outcome(audio, volume);
     } catch (err) {
-      return this.#failure(err);
+      await this.#reportFailure(err, { origin: 'manual', ref: raw, volume });
     } finally {
       this.#busy -= 1;
       this.#active.delete(own);
-      if (audio.temp) this.#removeTemp(audio.path);
+      if (audio?.temp) this.#removeTemp(audio.path);
     }
   }
 
-  #failure(err) {
+  /**
+   * 失败记进状态和日志；非取消、非停机的失败再推一条 audio-play.failed 事件。
+   * 自动播放的失败事件有冷却，避免一个坏后端把事件库刷满。
+   */
+  async #reportFailure(err, info) {
+    // 停机和取消不是播放失败：不记错误、不发事件。
+    if (this.#stopped) return;
+    if (err instanceof PlaybackError && err.code === 'aborted') return;
     const detail = err instanceof PlaybackError ? err.message : msg(err);
     this.#lastError = `${new Date().toISOString()} ${detail}`;
-    this.#host?.log?.warn?.('音频播放失败', { err: detail });
-    return { text: `[audio_play 失败] ${detail}`, failed: true };
+    this.#host?.log?.warn?.('音频播放失败', {
+      err: detail,
+      origin: info.origin,
+      ref: info.ref,
+      type: info.type,
+    });
+    if (info.origin === 'event') {
+      if (!this.#bool('autoPlay')) return;
+      const now = Date.now();
+      if (now - this.#lastAutoFailureAt < AUTO_FAILURE_EVENT_MS) return;
+      this.#lastAutoFailureAt = now;
+    }
+    await this.#pushFailure(detail, info);
+  }
+
+  async #pushFailure(detail, info) {
+    const host = this.#host;
+    if (!host?.pushEvent) return;
+    const label = info.origin === 'event' ? '自动播放失败' : '播放失败';
+    const bits = [`音量 ${info.volume}`];
+    if (info.ref) bits.unshift(`音频：${info.ref}`);
+    if (info.type) bits.push(`事件：${info.type}`);
+    try {
+      await host.pushEvent({
+        type: AUDIO_PLAY_FAILED_EVENT,
+        source: this.id,
+        ts: new Date().toISOString(),
+        text: `${label}：${detail}\n${bits.join(' · ')}`,
+        meta: {
+          origin: info.origin,
+          ref: info.ref ?? '',
+          type: info.type ?? '',
+          volume: info.volume,
+          backend: this.#backend(),
+        },
+      }, { deliver: true, trigger: 'debounce' });
+    } catch (err) {
+      host.log?.warn?.('音频播放：失败事件没送出去', { err: msg(err) });
+    }
   }
 
   /**
@@ -472,23 +580,18 @@ export class AudioPlayWorld {
     }
   }
 
-  /** 工具回执：只说结果和最基本的参数。 */
-  #outcome(audio, volume) {
-    const shown = audio.kind === 'handle' ? audio.ref : audio.name;
-    const bits = [formatBytes(audio.bytes), `音量 ${volume}`];
-    if (audio.kind === 'handle') bits.push('句柄');
-    return { text: `播放完了：${shown}（${bits.join(' · ')}）` };
-  }
-
   #state() {
     return {
       language: this.language,
       node: process.version,
       platform: process.platform,
-      backend: backendLabel(process.platform),
+      backend: this.#backendSays(),
+      backendId: this.#backend(),
+      command: this.#command(),
       supported: supportedPlatform(process.platform),
       tempDir: this.tempDir(),
       busy: this.#busy > 0,
+      queued: this.#queued,
       volume: Math.round(this.#num('volume', 0, 100)),
       timeoutMs: this.#timeout(),
       lastError: this.#lastError,
@@ -520,6 +623,12 @@ export class AudioPlayWorld {
         tone: state.volume > 0 ? 'on' : 'off',
       }],
       config: [configGroup(this.language)],
+      promptDocs: [{
+        key: `worlds.${ID}.env`,
+        title: t.promptTitle,
+        path: ENV_PROMPT,
+        role: 'envPrompt',
+      }],
     };
   }
 
@@ -541,7 +650,9 @@ export class AudioPlayWorld {
       host?.log?.warn?.('音频播放：临时目录建不出来', { err: msg(err) });
     }
     host?.log?.info?.('音频播放已就绪', {
-      backend: backendLabel(process.platform),
+      backend: this.#backend(),
+      backendLabel: this.#backendSays(),
+      command: this.#command(),
       volume: this.#volume({}),
       tempDir: this.tempDir(),
       autoPlay: this.#bool('autoPlay'),
@@ -557,6 +668,8 @@ export class AudioPlayWorld {
     }
     for (const own of this.#active) own.abort();
     this.#active.clear();
+    // 让排队中的任务跑完（它们看到 stopped 就直接返回），顺带清掉临时文件。
+    await this.#tail;
     this.#host = null;
   }
 }

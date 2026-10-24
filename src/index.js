@@ -6,6 +6,6 @@ import definition, { audioPlayDefinition } from './definition.js';
 
 export default definition;
 export { audioPlayDefinition };
-export { AudioPlayWorld } from './world.js';
+export { AUDIO_PLAY_FAILED_EVENT, AudioPlayWorld } from './world.js';
 export { ID as AUDIO_PLAY_WORLD_ID, DEFAULTS as AUDIO_PLAY_DEFAULTS } from './config.js';
-export { PlaybackError, backendLabel, playFile, supportedPlatform } from './player.js';
+export { AUDIO_PLAY_BACKENDS, PlaybackError, backendLabel, playFile, supportedPlatform } from './player.js';

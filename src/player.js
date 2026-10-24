@@ -1,11 +1,12 @@
 /**
- * 本机扬声器播放：把一个音频文件交给系统播放器，等它放完。
+ * 本机扬声器播放：把一个音频文件交给播放器，等它放完。
  *
  * 这里只认文件，不认句柄，也不合成音频。句柄由 World 先落成临时文件再交进来。
- * 没有 npm 依赖：
- * - Windows：`play.ps1` + WPF MediaPlayer（`powershell.exe`，系统自带）；
- * - macOS：`afplay`；
- * - Linux：`ffplay` / `mpv` / `paplay` / `aplay` 里第一个能用的。
+ * 播放器由 `worlds.audio-play.backend` 选择；`auto` 保持平台默认，没有 npm 依赖：
+ * - auto / Windows：`play.ps1` + WPF MediaPlayer（`powershell.exe`，系统自带）；
+ * - auto / macOS：`afplay`；
+ * - auto / Linux：`ffplay` / `mpv` / `paplay` / `aplay` 里第一个能用的；
+ * - 指定后端：ffplay、mpv、VLC、afplay、paplay、aplay，或用 `command` 配一条自定义命令。
  *
  * 播放器进程退出 0 = 放完了；其余退出码、超时和取消都变成 PlaybackError。
  */
@@ -14,6 +15,19 @@ import { fileURLToPath } from 'node:url';
 
 const PLAY_PS1 = fileURLToPath(new URL('./play.ps1', import.meta.url));
 const CAPTURE_BYTES = 16 * 1024;
+
+/** `worlds.audio-play.backend` 的可选值；`auto` 是平台默认。 */
+export const AUDIO_PLAY_BACKENDS = Object.freeze([
+  'auto',
+  'wpf',
+  'ffplay',
+  'mpv',
+  'vlc',
+  'afplay',
+  'paplay',
+  'aplay',
+  'custom',
+]);
 
 const msg = (err) => (err instanceof Error ? err.message : String(err));
 const clamp = (value, min, max) => Math.min(Math.max(value, min), max);
@@ -40,11 +54,19 @@ export class PlaybackError extends Error {
 }
 
 /** 给状态灯/日志看的后端名字。 */
-export function backendLabel(platform = process.platform) {
-  if (platform === 'win32') return 'Windows WPF MediaPlayer';
-  if (platform === 'darwin') return 'afplay';
-  if (platform === 'linux') return 'ffplay / mpv / paplay / aplay';
-  return '不支持的平台';
+export function backendLabel(platform = process.platform, backend = 'auto') {
+  const id = String(backend ?? '').trim().toLowerCase() || 'auto';
+  if (id === 'auto') {
+    if (platform === 'win32') return 'Windows WPF MediaPlayer';
+    if (platform === 'darwin') return 'afplay';
+    if (platform === 'linux') return 'ffplay / mpv / paplay / aplay';
+    return '不支持的平台';
+  }
+  if (id === 'wpf') return 'Windows WPF MediaPlayer';
+  if (id === 'vlc') return 'VLC';
+  if (id === 'custom') return '自定义命令';
+  if (AUDIO_PLAY_BACKENDS.includes(id)) return id;
+  return `未知后端（${id}）`;
 }
 
 export function supportedPlatform(platform = process.platform) {
@@ -227,6 +249,107 @@ async function playWithFfplay({ path, volume, timeoutMs, signal }) {
   throw new PlaybackError('failed', `ffplay 播放失败：${problem}`, problem);
 }
 
+async function playWithMpv({ path, volume, timeoutMs, signal }) {
+  const result = await run('mpv', [
+    '--no-video',
+    '--really-quiet',
+    `--volume=${volume}`,
+    path,
+  ], {
+    timeoutMs: timeoutMs + 5000,
+    signal,
+  });
+  if (result.code === 0) return { backend: 'mpv' };
+  throw failed('mpv', result);
+}
+
+async function playWithVlc({ path, volume, timeoutMs, signal }) {
+  // VLC 的 --volume 是 0–512，256 等于 100%。
+  const result = await run('vlc', [
+    '--play-and-exit',
+    '--no-video',
+    '--intf',
+    'dummy',
+    '--volume',
+    String(Math.round((volume * 512) / 100)),
+    path,
+  ], {
+    timeoutMs: timeoutMs + 5000,
+    signal,
+  });
+  if (result.code === 0) return { backend: 'vlc' };
+  throw failed('vlc', result);
+}
+
+async function playPaplay({ path, timeoutMs, signal }) {
+  const result = await run('paplay', [path], { timeoutMs: timeoutMs + 5000, signal });
+  if (result.code === 0) return { backend: 'paplay' };
+  throw failed('paplay', result);
+}
+
+async function playAplay({ path, timeoutMs, signal }) {
+  const result = await run('aplay', ['-q', path], { timeoutMs: timeoutMs + 5000, signal });
+  if (result.code === 0) return { backend: 'aplay' };
+  throw failed('aplay', result);
+}
+
+/** 按空白切分自定义命令，双引号和单引号都能包住一个参数。 */
+function tokenizeCommand(template) {
+  const tokens = [];
+  let token = '';
+  let quote = '';
+  let started = false;
+  for (const ch of String(template ?? '')) {
+    if (quote) {
+      if (ch === quote) quote = '';
+      else token += ch;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      started = true;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (started) {
+        tokens.push(token);
+        token = '';
+        started = false;
+      }
+      continue;
+    }
+    token += ch;
+    started = true;
+  }
+  if (quote) throw new PlaybackError('failed', '自定义命令的引号没有闭合。');
+  if (started) tokens.push(token);
+  return tokens;
+}
+
+async function playCustom({ path, volume, timeoutMs, signal, command }) {
+  const template = String(command ?? '').trim();
+  if (!template) {
+    throw new PlaybackError('missing', '播放后端是 custom，但配置里的 command 是空的。');
+  }
+  if (!template.includes('{file}')) {
+    throw new PlaybackError('missing', '自定义命令里缺少 {file}：把音频文件的位置写成 {file}，例如 mpv --no-video --volume={volume} "{file}"。');
+  }
+  const tokens = tokenizeCommand(template)
+    .map((one) => one.replaceAll('{volume}', String(volume)).replaceAll('{file}', path));
+  const [bin, ...args] = tokens;
+  if (!bin) {
+    throw new PlaybackError('missing', '自定义命令替换后没有可执行的命令。');
+  }
+  const result = await run(bin, args, { timeoutMs: timeoutMs + 5000, signal });
+  if (result.code === 0) return { backend: 'custom' };
+  const detail = detailOf(result);
+  throw new PlaybackError(
+    'failed',
+    `自定义播放器 ${bin} 播放失败（退出码 ${result.code}）。${detail ? ` ${detail}` : ''}`,
+    detail,
+  );
+}
+
 async function playWindows(opts) {
   try {
     return await playWindowsWpf(opts);
@@ -238,7 +361,7 @@ async function playWindows(opts) {
       return await playWithFfplay(opts);
     } catch (fallback) {
       if (fallback instanceof PlaybackError && fallback.code === 'missing') {
-        original.message = `${original.message} 可以先转成 wav / mp3，或安装 ffplay 再试。`;
+        original.message = `${original.message} 可以先转成 wav / mp3，或在配置里换一个播放后端（ffplay / mpv / custom）再试。`;
         throw original;
       }
       const extra = fallback instanceof PlaybackError ? fallback.message : msg(fallback);
@@ -256,52 +379,63 @@ async function playDarwin({ path, volume, timeoutMs, signal }) {
   throw failed('afplay', result);
 }
 
-async function playLinux({ path, volume, timeoutMs, signal }) {
-  const candidates = [
-    {
-      command: 'ffplay',
-      backend: 'ffplay',
-      args: ['-nodisp', '-autoexit', '-loglevel', 'error', '-volume', String(volume), path],
-    },
-    {
-      command: 'mpv',
-      backend: 'mpv',
-      args: ['--no-video', '--really-quiet', '--no-terminal', `--volume=${volume}`, path],
-    },
-    {
-      command: 'paplay',
-      backend: 'paplay',
-      args: [path],
-    },
-    {
-      command: 'aplay',
-      backend: 'aplay',
-      args: ['-q', path],
-    },
-  ];
-
+async function playLinux(opts) {
+  const candidates = [playWithFfplay, playWithMpv, playPaplay, playAplay];
   let failure = null;
-  for (const one of candidates) {
+  for (const play of candidates) {
     try {
-      const result = await run(one.command, one.args, {
-        timeoutMs: timeoutMs + 5000,
-        signal,
-      });
-      if (one.command === 'ffplay') {
-        const problem = ffplayProblem(result);
-        if (!problem) return { backend: one.backend };
-        failure = new PlaybackError('failed', `ffplay 播放失败：${problem}`, problem);
-        continue;
-      }
-      if (result.code === 0) return { backend: one.backend };
-      failure = failed(one.command, result);
+      return await play(opts);
     } catch (err) {
       if (err instanceof PlaybackError && err.code === 'missing') continue;
+      if (err instanceof PlaybackError && err.code === 'failed') {
+        failure = err;
+        continue;
+      }
       throw err;
     }
   }
   if (failure) throw failure;
   throw new PlaybackError('missing', '没有可用的播放命令：安装 ffplay、mpv、paplay 或 aplay 之一。');
+}
+
+const PLATFORM_ONLY = {
+  wpf: { platform: 'win32', label: 'Windows' },
+  afplay: { platform: 'darwin', label: 'macOS' },
+  paplay: { platform: 'linux', label: 'Linux' },
+  aplay: { platform: 'linux', label: 'Linux' },
+};
+
+const MISSING_HINTS = {
+  ffplay: '安装 ffplay（ffmpeg 的一部分）并放进 PATH，或在配置里换一个后端。',
+  mpv: '安装 mpv 并放进 PATH，或在配置里换一个后端。',
+  vlc: '安装 VLC 并让 vlc 在 PATH 里，或用 custom 后端指向 vlc.exe。',
+  paplay: '安装 PulseAudio 的 paplay，或在配置里换一个后端。',
+  aplay: '安装 ALSA 的 aplay，或在配置里换一个后端。',
+};
+
+async function playExplicit(backend, platform, opts) {
+  const only = PLATFORM_ONLY[backend];
+  if (only && platform !== only.platform) {
+    throw new PlaybackError('missing', `${backend} 后端只适用于 ${only.label}（当前系统是 ${platform}）。`);
+  }
+  const play = {
+    wpf: playWindowsWpf,
+    ffplay: playWithFfplay,
+    mpv: playWithMpv,
+    vlc: playWithVlc,
+    afplay: playDarwin,
+    paplay: playPaplay,
+    aplay: playAplay,
+    custom: playCustom,
+  }[backend];
+  try {
+    return await play(opts);
+  } catch (err) {
+    if (err instanceof PlaybackError && err.code === 'missing' && MISSING_HINTS[backend]) {
+      err.message = `${err.message} ${MISSING_HINTS[backend]}`;
+    }
+    throw err;
+  }
 }
 
 /**
@@ -313,8 +447,10 @@ async function playLinux({ path, volume, timeoutMs, signal }) {
  *   timeoutMs?: number,
  *   signal?: AbortSignal,
  *   platform?: NodeJS.Platform,
+ *   backend?: string,
+ *   command?: string,
  * }} opts
- * @returns {Promise<{backend: 'wpf'|'ffplay'|'afplay'|'mpv'|'paplay'|'aplay'}>}
+ * @returns {Promise<{backend: 'wpf'|'ffplay'|'afplay'|'mpv'|'vlc'|'paplay'|'aplay'|'custom'}>}
  */
 export async function playFile(opts = {}) {
   const path = String(opts.path ?? '');
@@ -323,7 +459,14 @@ export async function playFile(opts = {}) {
   const volume = Number.isFinite(rawVolume) ? clamp(Math.round(rawVolume), 0, 100) : 80;
   const timeoutMs = Math.max(1000, Math.round(Number(opts.timeoutMs) || 120000));
   const platform = opts.platform ?? process.platform;
-  const common = { path, volume, timeoutMs, signal: opts.signal };
+  const wanted = String(opts.backend ?? '').trim().toLowerCase();
+  const backend = wanted || 'auto';
+  const common = { path, volume, timeoutMs, signal: opts.signal, command: String(opts.command ?? '') };
+
+  if (!AUDIO_PLAY_BACKENDS.includes(backend)) {
+    throw new PlaybackError('missing', `未知的播放后端「${backend}」；可选 ${AUDIO_PLAY_BACKENDS.join(' / ')}。`);
+  }
+  if (backend !== 'auto') return playExplicit(backend, platform, common);
 
   if (platform === 'win32') return playWindows(common);
   if (platform === 'darwin') return playDarwin(common);

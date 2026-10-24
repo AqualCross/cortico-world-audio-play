@@ -5,7 +5,7 @@
  *   node tools/smoke.mjs
  *   $env:SMOKE_HANDLE = "1"; node tools/smoke.mjs    # 走 log: 句柄
  *
- * 可调：SMOKE_SECONDS / SMOKE_VOLUME / SMOKE_FREQ。
+ * 可调：SMOKE_SECONDS / SMOKE_VOLUME / SMOKE_FREQ / SMOKE_BACKEND / SMOKE_COMMAND。
  */
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -15,9 +15,12 @@ import definition from '../src/definition.js';
 import { AudioPlayWorld } from '../src/world.js';
 
 const seconds = Math.min(Math.max(Number(process.env.SMOKE_SECONDS) || 0.6, 0.1), 5);
-const volume = Math.min(Math.max(Number(process.env.SMOKE_VOLUME) || 30, 0), 100);
+const rawVolume = Number(process.env.SMOKE_VOLUME ?? 30);
+const volume = Math.min(Math.max(Number.isFinite(rawVolume) ? rawVolume : 30, 0), 100);
 const freq = Math.min(Math.max(Number(process.env.SMOKE_FREQ) || 440, 80), 2000);
 const useHandle = process.argv.includes('--handle') || process.env.SMOKE_HANDLE === '1';
+const backend = String(process.env.SMOKE_BACKEND ?? '').trim();
+const command = String(process.env.SMOKE_COMMAND ?? '');
 
 /** 低音量 440 Hz 正弦波，16-bit 单声道 PCM；不联网、不依赖任何东西。 */
 function sampleWav(seconds, freq, amplitude = 0.22) {
@@ -53,11 +56,18 @@ writeFileSync(file, bytes);
 
 const host = {
   blob: (handle) => (handle === 'log:smoke.wav' ? { bytes, mime: 'audio/wav' } : null),
+  store: { latestCursor: () => 0, range: () => [] },
   log: { info: () => {}, warn: (message, data) => console.warn(`[warn] ${message}`, data ?? ''), child() { return this; } },
 };
 
 const world = new AudioPlayWorld({
-  cfg: { ...definition.defaults(), enabled: true, volume },
+  cfg: {
+    ...definition.defaults(),
+    enabled: true,
+    volume,
+    ...(backend ? { backend } : {}),
+    ...(command ? { command } : {}),
+  },
   dataDir: join(scratch, 'data'),
   botDir: scratch,
 });
@@ -65,12 +75,14 @@ await world.start(host);
 
 try {
   const audio = useHandle ? 'log:smoke.wav' : file;
-  console.log(`播放：${useHandle ? audio : file}（${seconds.toFixed(1)} 秒，音量 ${volume}）`);
+  console.log(`播放：${useHandle ? audio : file}（${seconds.toFixed(1)} 秒，音量 ${volume}，后端 ${backend || 'auto'}）`);
   const started = Date.now();
   const out = await world.tools()[0].handler({ audio }, {});
-  const elapsed = ((Date.now() - started) / 1000).toFixed(2);
+  const receiptAt = Date.now();
   console.log(out.text);
-  console.log(`用时：${elapsed} 秒`);
+  console.log(`回执用时：${((receiptAt - started) / 1000).toFixed(2)} 秒（不等播放结束）`);
+  await world.whenIdle();
+  console.log(`后台播放用时：${((Date.now() - started) / 1000).toFixed(2)} 秒`);
   if (out.failed) process.exitCode = 1;
 } finally {
   await world.stop();
