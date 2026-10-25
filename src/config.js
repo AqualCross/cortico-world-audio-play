@@ -34,6 +34,8 @@ const ZH = {
   lamp: '播放后端',
   lampHint: (backend) => `本机扬声器 · ${backend}`,
   promptTitle: '提示词',
+  panelQueueTitle: '队列',
+  panelQueueDesc: '正在播放与排队中的音频；可跳过当前、移除排队项或清空队列。',
   config: {
     title: '音频播放',
     volume: '音量',
@@ -57,6 +59,8 @@ const EN = {
   lamp: 'Playback',
   lampHint: (backend) => `local speakers · ${backend}`,
   promptTitle: 'Prompt',
+  panelQueueTitle: 'Queue',
+  panelQueueDesc: 'Audio playing now and waiting in line; skip the current item, remove a waiting one, or clear the queue.',
   config: {
     title: 'Audio Play',
     volume: 'Volume',

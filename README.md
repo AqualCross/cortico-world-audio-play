@@ -220,9 +220,14 @@ Windows 的 PowerShell 脚本退出码会翻成中文提示：
 
 ## 控制台页
 
-没有自定义面板（这个扩展刻意只做三个工具）。控制台左栏会多出「音频播放」：
-状态灯显示当前选择的播放后端，徽标显示默认音量，「配置」页可以改是否启用、音量、超时、
-播放后端与自定义命令。所有配置都在 `worlds.audio-play` 段，热改就地生效。
+控制台左栏会多出「音频播放」：状态灯显示当前选择的播放后端，徽标显示默认音量。
+
+「队列」页显示正在播放与排队中的音频：每条带 id、来源（手动 / 事件类型）、音量，当前这条
+还显示已播时长；可以跳过当前、按条移除、清空队列。队列变化会实时推送到页面，页面关闭时
+不轮询；推送断开时每 3 秒补一次快照。
+
+「配置」页可以改是否启用、音量、超时、播放后端与自定义命令。所有配置都在 `worlds.audio-play`
+段，热改就地生效。
 
 「提示词」页默认是空的：工具描述已经够用，不写不会往系统前缀里加任何内容；需要补充
 播放习惯或使用约定时再写。
@@ -263,18 +268,20 @@ $env:SMOKE_HANDLE = "1"; node tools/smoke.mjs
 
 ```
 cortico-world-audio-play/
-├─ package.json        # cortico: { kind: world, api: 6, describe: describe.json }
-├─ describe.json       # 自描述：工具与事件（pnpm describe:extension 生成）
+├─ package.json        # cortico: { kind: world, api: 6, webUiClient, describe }
+├─ describe.json       # 自描述：工具、事件与提示词（pnpm describe:extension 生成）
 ├─ CHANGELOG.md
 ├─ README.md
 ├─ src/
 │  ├─ index.js         # 入口：default 导出 WorldDefinition
 │  ├─ definition.js    # id/label/defaults/preflight/create/describe
 │  ├─ config.js        # worlds.audio-play 默认值、中英文案、配置组 schema
-│  ├─ world.js         # AudioPlayWorld：参数解析、句柄落临时文件、工具与生命周期
+│  ├─ world.js         # AudioPlayWorld：参数解析、显式队列、队列页接口与生命周期
 │  ├─ ENV_PROMPT.md    # 控制台「提示词」页的模板，默认空
 │  ├─ player.js        # 后端分派：auto / wpf / ffplay / mpv / vlc / afplay / paplay / aplay / custom
 │  └─ play.ps1         # Windows 的 WPF MediaPlayer 播放脚本（纯 ASCII）
+├─ dist/
+│  └─ webui.js         # 「队列」页（纯浏览器 ES 模块，无需构建）
 └─ tools/
    ├─ check.mjs        # 离线检查
    ├─ describe.mjs     # 重新生成 describe.json

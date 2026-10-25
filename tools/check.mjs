@@ -118,6 +118,19 @@ async function until(check, timeoutMs = 2500) {
   throw new Error('condition never held');
 }
 
+/** 面板推送用的假 socket；每一帧都按 JSON 解析后留在 frames 里。 */
+function fakeSocket() {
+  const frames = [];
+  return {
+    frames,
+    open: true,
+    send: (raw) => frames.push(JSON.parse(raw)),
+    onClose: () => {},
+    onMessage: () => {},
+    close: () => {},
+  };
+}
+
 function writeFile(path, bytes = Buffer.from('fake-audio-bytes')) {
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, bytes);
@@ -137,8 +150,9 @@ try {
     assert(Array.isArray(manifest.keywords) && manifest.keywords.includes('cortico-world'), 'keywords 缺 cortico-world');
     assert(Array.isArray(manifest.files) && manifest.files.includes('describe.json'), 'files 缺 describe.json');
     assert(existsSync(join(pkgDir, 'describe.json')), 'describe.json 不在包里');
-    // 这个 World 不要浏览器面板；没有 webUiClient 是刻意的。
-    assert(manifest.cortico?.webUiClient === undefined, '不该声明 webUiClient');
+    eq(manifest.cortico?.webUiClient, 'dist/webui.js', 'webUiClient');
+    assert(manifest.files.includes('dist'), 'files 缺 dist');
+    assert(existsSync(join(pkgDir, 'dist', 'webui.js')), 'dist/webui.js 不在包里');
     assert(existsSync(join(pkgDir, 'src', 'ENV_PROMPT.md')), '缺提示词模板 src/ENV_PROMPT.md');
     if (process.platform === 'win32') assert(existsSync(join(pkgDir, 'src', 'play.ps1')), 'Windows 缺 src/play.ps1');
   });
@@ -215,13 +229,19 @@ try {
     }
   });
 
-  check('空的提示词页，WebUI 只有配置、提示词与状态灯', () => {
+  check('空的提示词页，配置、提示词、状态灯与队列面板', () => {
     const world = makeWorld();
     const vars = world.envPromptVars();
     assert(vars && typeof vars === 'object' && Object.keys(vars).length === 0, 'envPromptVars 应为空对象');
     const decl = world.webUi('zh');
     assert(Array.isArray(decl.config) && decl.config.length === 1, '缺配置组');
-    assert(!decl.panels || decl.panels.length === 0, '不该声明自定义面板');
+    assert(Array.isArray(decl.panels) && decl.panels.length === 1, '缺队列面板');
+    const panel = decl.panels[0];
+    eq(panel.id, 'queue', '面板 id');
+    eq(panel.title, '队列', '面板标题');
+    assert(panel.getMethods?.includes('list'), 'list 应当可 GET');
+    eq(typeof decl.invoke, 'function', '缺 invoke');
+    eq(typeof decl.stream, 'function', '缺 stream');
     assert(Array.isArray(decl.lamps) && decl.lamps.length === 1, '缺状态灯');
     assert(Array.isArray(decl.badges) && decl.badges.length === 1, '缺徽标');
     assert(Array.isArray(decl.promptDocs) && decl.promptDocs.length === 1, '缺提示词页');
@@ -231,6 +251,19 @@ try {
     eq(doc.role, 'envPrompt', '提示词角色');
     assert(existsSync(doc.path), `提示词模板不存在：${doc.path}`);
     eq(readFileSync(doc.path, 'utf8'), '', '提示词模板默认应为空');
+    const en = world.webUi('en');
+    eq(en.panels[0].title, 'Queue', '英文面板标题');
+  });
+
+  await checkAsync('WebUI bundle 是纯浏览器模块，导出 queue 面板', async () => {
+    const file = join(pkgDir, 'dist', 'webui.js');
+    const src = readFileSync(file, 'utf8');
+    assert(!/^\s*import\s/m.test(src), 'bundle 不应 import 任何东西');
+    assert(src.includes("invoke('list'"), 'bundle 应当调用 list');
+    assert(src.includes("run('skip'") && src.includes("run('remove'") && src.includes("run('clear'"), 'bundle 应当调用 skip / remove / clear');
+    const bundle = await import(pathToFileURL(file).href);
+    eq(typeof bundle.default?.panels?.queue?.mount, 'function', 'bundle.panels.queue.mount');
+    eq(Object.keys(bundle.default.panels).join(','), 'queue', 'bundle 面板清单');
   });
 
   // -------------------------------------------------------------------------
@@ -669,6 +702,93 @@ try {
     const listed = await queue.handler({ action: 'list' }, {});
     assert(listed.text.includes('正在播放：（空）') && listed.text.includes('排队：（空）'), listed.text);
     await world.stop();
+  });
+
+  await checkAsync('队列页：list 快照，skip / remove / clear', async () => {
+    const one = writeFile(join(scratch, 'panel-one.wav'));
+    const two = writeFile(join(scratch, 'panel-two.wav'));
+    const three = writeFile(join(scratch, 'panel-three.wav'));
+    const world = makeWorld({ volume: 60 }, {
+      play: ({ signal }) => new Promise((resolve, reject) => {
+        const stop = () => reject(new player.PlaybackError('aborted', '播放被取消。'));
+        if (signal.aborted) {
+          stop();
+          return;
+        }
+        signal.addEventListener('abort', stop, { once: true });
+      }),
+    });
+    const [play] = world.tools();
+    await play.handler({ audio: one }, {});
+    await play.handler({ audio: two }, {});
+    await play.handler({ audio: three }, {});
+
+    const view = await world.invoke('queue', 'list', []);
+    eq(view.counts.current, 1, '当前条数');
+    eq(view.counts.pending, 2, '排队条数');
+    eq(view.current.id, 'q1', '当前 id');
+    eq(view.pending.map((x) => x.id).join(','), 'q2,q3', '排队 id');
+    assert(view.current.shown.endsWith('panel-one.wav'), view.current.shown);
+    eq(view.current.origin, 'manual', '来源');
+    eq(view.current.volume, 60, '音量');
+    eq(view.backend, player.backendLabel(process.platform, 'auto'), '后端');
+
+    const removed = await world.invoke('queue', 'remove', ['q2']);
+    eq(removed.ok, true, '移除结果');
+    eq(removed.counts.pending, 1, '移除后的排队数');
+    eq(removed.pending[0].id, 'q3', '移除后剩下的条目');
+    assert(removed.message.includes('q2'), removed.message);
+
+    let currentError = null;
+    try {
+      await world.invoke('queue', 'remove', ['q1']);
+    } catch (err) {
+      currentError = err;
+    }
+    assert(currentError && currentError.message.includes('skip'), currentError?.message);
+    let missing = null;
+    try {
+      await world.invoke('queue', 'remove', []);
+    } catch (err) {
+      missing = err;
+    }
+    assert(missing && missing.message.includes('id'), missing?.message);
+    let badPanel = null;
+    try {
+      await world.invoke('nope', 'list', []);
+    } catch (err) {
+      badPanel = err;
+    }
+    assert(badPanel && badPanel.message.includes('未知面板'), badPanel?.message);
+
+    const skipped = await world.invoke('queue', 'skip', []);
+    eq(skipped.ok, true, '跳过结果');
+    assert(skipped.message.includes('q1'), skipped.message);
+    await until(() => world.__calls.some((one) => one.path.endsWith('panel-three.wav')));
+    const after = await world.invoke('queue', 'list', []);
+    eq(after.current?.id, 'q3', '跳过后接着放');
+    eq(after.counts.pending, 0, '跳过后排队数');
+
+    const cleared = await world.invoke('queue', 'clear', []);
+    eq(cleared.ok, true, '清空结果');
+    eq(cleared.counts.current, 0, '清空后当前');
+    eq(cleared.counts.pending, 0, '清空后排队');
+    await world.whenIdle();
+  });
+
+  await checkAsync('队列页推送：ready 与每次变化', async () => {
+    const one = writeFile(join(scratch, 'panel-stream.wav'));
+    const world = makeWorld({}, {
+      play: () => new Promise((resolve) => { setTimeout(() => resolve({ backend: 'fake' }), 20); }),
+    });
+    const socket = fakeSocket();
+    world.stream('queue', socket);
+    eq(socket.frames[0]?.t, 'ready', 'ready 帧');
+    eq(socket.frames[0]?.queue?.counts?.current, 0, 'ready 快照');
+    await world.tools()[0].handler({ audio: one }, {});
+    assert(socket.frames.some((f) => f.t === 'queue' && f.queue.current?.id === 'q1'), '开始播放帧');
+    await world.whenIdle();
+    assert(socket.frames.some((f) => f.t === 'queue' && !f.queue.current && f.queue.counts.pending === 0), '结束帧');
   });
 
   await checkAsync('中断信号会取消后台播放，取消不算失败事件', async () => {

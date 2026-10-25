@@ -116,6 +116,7 @@ export class AudioPlayWorld {
   #busy = 0;
   #stopped = false;
   #idleWaiters = new Set();
+  #streams = new Set();
   #lastAutoFailureAt = 0;
   #lastError = '';
   #lastPlayedAt = '';
@@ -290,6 +291,7 @@ export class AudioPlayWorld {
         return;
       }
       const events = host.store.range({ fromCursor: this.#watchCursor + 1, limit: 20 });
+      let added = 0;
       for (const event of events) {
         this.#watchCursor = Math.max(this.#watchCursor, event.cursor);
         if (!types.has(event.type)) continue;
@@ -303,8 +305,10 @@ export class AudioPlayWorld {
           volume: this.#volume({}),
           timeoutMs: this.#timeout(),
         }));
+        added += 1;
         this.#pump();
       }
+      if (added) this.#emitQueue();
     } catch (err) {
       this.#lastError = `${new Date().toISOString()} 读事件失败：${msg(err)}`;
     }
@@ -352,6 +356,7 @@ export class AudioPlayWorld {
       this.#current = item;
       item.startedAt = Date.now();
       this.#busy = 1;
+      this.#emitQueue();
       const done = this.#runItem(item)
         .catch((err) => {
           this.#host?.log?.warn?.('音频播放：后台任务异常', { err: msg(err) });
@@ -361,6 +366,7 @@ export class AudioPlayWorld {
           this.#busy = 0;
           this.#running = null;
           this.#pump();
+          this.#emitQueue();
         });
       this.#running = done;
       void done;
@@ -405,6 +411,7 @@ export class AudioPlayWorld {
     this.#pending.push(item);
     const behind = Math.max(0, (this.#current ? 1 : 0) + this.#pending.length - 1);
     this.#pump();
+    this.#emitQueue();
 
     const head = behind > 0 ? `已排队（${item.id}，前面还有 ${behind} 条）` : `开始播放（${item.id}）`;
     return { text: `${head}：${item.shown}（音量 ${volume}）；放完不再回报，失败会以事件通知。` };
@@ -435,35 +442,50 @@ export class AudioPlayWorld {
   #queueAction(args) {
     const action = asText(args.action) || 'list';
     const id = asText(args.id);
+    let result;
     switch (action) {
       case 'list':
-        return { text: this.#queueSays() };
+        result = { text: this.#queueSays() };
+        break;
       case 'skip': {
         if (!this.#current) {
           const next = this.#pending.shift();
-          if (!next) return { text: '播放队列是空的，没有可跳过的。' };
+          if (!next) {
+            result = { text: '播放队列是空的，没有可跳过的。' };
+            break;
+          }
           next.cancelled = true;
           next.controller.abort();
-          return { text: `已跳过 ${next.id}（${next.shown ?? this.#shownOf(next.ref)}）；队列里还有 ${this.#pending.length} 条。` };
+          result = { text: `已跳过 ${next.id}（${next.shown ?? this.#shownOf(next.ref)}）；队列里还有 ${this.#pending.length} 条。` };
+          break;
         }
         const item = this.#current;
         item.controller.abort();
         const next = this.#pending[0];
-        return {
+        result = {
           text: `已跳过 ${item.id}（${item.shown ?? this.#shownOf(item.ref)}）；${next ? `下一条 ${next.id} 接着放` : '队列里没有别的了'}。`,
         };
+        break;
       }
       case 'remove': {
-        if (!id) return { text: '[audio_queue 没执行] remove 需要 id，先用 action=list 看队列。', failed: true };
+        if (!id) {
+          result = { text: '[audio_queue 没执行] remove 需要 id，先用 action=list 看队列。', failed: true };
+          break;
+        }
         if (this.#current?.id === id) {
-          return { text: `[audio_queue 没执行] ${id} 正在播放，要停它用 skip。`, failed: true };
+          result = { text: `[audio_queue 没执行] ${id} 正在播放，要停它用 skip。`, failed: true };
+          break;
         }
         const index = this.#pending.findIndex((one) => one.id === id);
-        if (index < 0) return { text: `[audio_queue 没执行] 队列里没有 ${id}，先用 action=list 看一遍。`, failed: true };
+        if (index < 0) {
+          result = { text: `[audio_queue 没执行] 队列里没有 ${id}，先用 action=list 看一遍。`, failed: true };
+          break;
+        }
         const [removed] = this.#pending.splice(index, 1);
         removed.cancelled = true;
         removed.controller.abort();
-        return { text: `已从队列移除 ${removed.id}（${removed.shown ?? this.#shownOf(removed.ref)}）；队列里还有 ${this.#pending.length} 条。` };
+        result = { text: `已从队列移除 ${removed.id}（${removed.shown ?? this.#shownOf(removed.ref)}）；队列里还有 ${this.#pending.length} 条。` };
+        break;
       }
       case 'clear': {
         const current = this.#current;
@@ -475,11 +497,14 @@ export class AudioPlayWorld {
         this.#pending = [];
         current?.controller.abort();
         const head = current ? `已停止 ${current.id}` : '没有正在播放的';
-        return { text: `${head}；清空排队 ${dropped} 条。` };
+        result = { text: `${head}；清空排队 ${dropped} 条。` };
+        break;
       }
       default:
-        return { text: '[audio_queue 没执行] action 只能是 list、skip、remove 或 clear。', failed: true };
+        result = { text: '[audio_queue 没执行] action 只能是 list、skip、remove 或 clear。', failed: true };
     }
+    if (action !== 'list' && !result.failed) this.#emitQueue();
+    return result;
   }
 
   /** 后台播放一条：解析音频、等播放器结束、清临时文件；失败推事件。 */
@@ -715,8 +740,92 @@ export class AudioPlayWorld {
   }
 
   // -------------------------------------------------------------------------
-  // WebUI：只有配置组与状态灯，没有自定义面板
+  // WebUI：队列页、配置组与提示词
   // -------------------------------------------------------------------------
+
+  #queueSnapshot() {
+    const now = Date.now();
+    const view = (item, position) => ({
+      id: item.id,
+      shown: item.shown ?? this.#shownOf(item.ref),
+      ref: item.ref,
+      volume: item.volume,
+      origin: item.origin,
+      type: item.type ?? '',
+      position,
+      startedAtMs: item.startedAt || 0,
+      elapsedSec: item.startedAt ? Math.max(0, Math.round((now - item.startedAt) / 1000)) : 0,
+    });
+    return {
+      current: this.#current ? view(this.#current, 0) : null,
+      pending: this.#pending.map((item, index) => view(item, index + 1)),
+      counts: { current: this.#current ? 1 : 0, pending: this.#pending.length },
+      backend: this.#backendSays(),
+      autoPlay: this.#bool('autoPlay'),
+      watchEvents: watchTypes(this.#raw('watchEvents')).join(', '),
+    };
+  }
+
+  #emitQueue() {
+    if (!this.#streams.size) return;
+    const frame = { t: 'queue', queue: this.#queueSnapshot() };
+    for (const peer of this.#streams) peer.send(frame);
+  }
+
+  async invoke(panel, method, args = []) {
+    const list = Array.isArray(args) ? args : [args];
+    if (panel !== 'queue') throw new Error(`未知面板：${panel}`);
+    switch (method) {
+      case 'list': return this.#queueSnapshot();
+      case 'skip': return this.#panelAction('skip');
+      case 'remove': return this.#panelAction('remove', asText(list[0]));
+      case 'clear': return this.#panelAction('clear');
+      default: throw new Error(`未知面板方法：queue.${method}`);
+    }
+  }
+
+  async #panelAction(action, id) {
+    // 跳/清会中止当前这条；等它真正收尾后再取快照，页面不会先看到一个过期的当前项。
+    const running = action === 'skip' || action === 'clear' ? this.#running : null;
+    const result = this.#queueAction({ action, id });
+    if (result.failed) throw new Error(result.text.replace(/^\[audio_queue 没执行\]\s*/, ''));
+    if (running) {
+      try {
+        await running;
+      } catch {
+        /* 后台任务自己会记日志。 */
+      }
+    }
+    return { ok: true, message: result.text, ...this.#queueSnapshot() };
+  }
+
+  stream(panel, socket) {
+    if (panel !== 'queue') {
+      try {
+        socket.close(`未知面板：${panel}`);
+      } catch {
+        /* ignore */
+      }
+      return;
+    }
+    const peer = {
+      send: (frame) => {
+        try {
+          if (socket.open) socket.send(JSON.stringify(frame));
+        } catch {
+          /* 连接断了就算了，面板会自己重连。 */
+        }
+      },
+    };
+    this.#streams.add(peer);
+    try {
+      socket.onClose(() => this.#streams.delete(peer));
+      socket.onMessage(() => { /* 面板只用 HTTP 请求，回帧不处理。 */ });
+    } catch {
+      /* 宿主实现不支持回调也不影响单向推送。 */
+    }
+    peer.send({ t: 'ready', queue: this.#queueSnapshot() });
+  }
 
   webUi(language = 'zh') {
     this.language = language === 'en' ? 'en' : 'zh';
@@ -734,6 +843,12 @@ export class AudioPlayWorld {
         value: `${state.volume}%`,
         tone: state.volume > 0 ? 'on' : 'off',
       }],
+      panels: [{
+        id: 'queue',
+        title: t.panelQueueTitle,
+        description: t.panelQueueDesc,
+        getMethods: ['list'],
+      }],
       config: [configGroup(this.language)],
       promptDocs: [{
         key: `worlds.${ID}.env`,
@@ -741,6 +856,8 @@ export class AudioPlayWorld {
         path: ENV_PROMPT,
         role: 'envPrompt',
       }],
+      invoke: (panel, method, args) => this.invoke(panel, method, args),
+      stream: (panel, socket) => this.stream(panel, socket),
     };
   }
 
@@ -754,6 +871,7 @@ export class AudioPlayWorld {
     this.#pending = [];
     this.#current = null;
     this.#running = null;
+    this.#streams.clear();
     if (this.#timer) clearInterval(this.#timer);
     this.#watchCursor = host.store.latestCursor();
     this.#timer = setInterval(() => this.#scanWatched(), this.#scanMs);
@@ -800,6 +918,7 @@ export class AudioPlayWorld {
     this.#current = null;
     this.#busy = 0;
     this.#running = null;
+    this.#streams.clear();
     this.#settleIdle();
     if (current || dropped) {
       this.#host?.log?.info?.('音频播放已停止', { droppedQueued: dropped, stoppedCurrent: current?.id ?? '' });
