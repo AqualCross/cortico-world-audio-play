@@ -86,6 +86,19 @@ export const AUDIO_PLAY_TOOL_DECLS = [
       required: ['action'],
     },
   },
+  {
+    name: 'audio_queue',
+    tags: ['act'],
+    description: 'Read or change the playback queue. list shows what is playing now and what is waiting; skip stops the current item and lets the next one start; remove drops one waiting item by id; clear stops the current item and drops everything waiting. Skipping and clearing are cancellations, not failures: no audio-play.failed event is sent. Manual plays and watched event audio share one queue; ids come from an audio_play receipt or from list.',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['list', 'skip', 'remove', 'clear'], description: 'list = current item and waiting items; skip = stop the current item; remove = drop one waiting item; clear = stop the current item and drop all waiting items.' },
+        id: { type: 'string', description: 'For remove: the queue id to drop, e.g. q7. The current item cannot be removed; use skip.' },
+      },
+      required: ['action'],
+    },
+  },
 ];
 
 function extensionOf(name, mime) {
@@ -96,11 +109,13 @@ function extensionOf(name, mime) {
 
 export class AudioPlayWorld {
   #host = null;
-  #active = new Set();
-  #tail = Promise.resolve();
-  #queued = 0;
+  #pending = [];
+  #current = null;
+  #running = null;
+  #seq = 0;
   #busy = 0;
   #stopped = false;
+  #idleWaiters = new Set();
   #lastAutoFailureAt = 0;
   #lastError = '';
   #lastPlayedAt = '';
@@ -192,6 +207,7 @@ export class AudioPlayWorld {
     return [
       { ...AUDIO_PLAY_TOOL_DECLS[0], handler: (args, ctx) => this.#play(args ?? {}, ctx) },
       { ...AUDIO_PLAY_TOOL_DECLS[1], handler: async (args) => this.#watchAction(args ?? {}) },
+      { ...AUDIO_PLAY_TOOL_DECLS[2], handler: async (args) => this.#queueAction(args ?? {}) },
     ];
   }
 
@@ -205,7 +221,8 @@ export class AudioPlayWorld {
     const auto = this.#bool('autoPlay') ? 'on' : 'off';
     const bits = [`自动播放：${auto}`, `监听：${types.join(', ') || '（空）'}`, `后端：${this.#backendSays()}`];
     if (this.#backend() === 'custom') bits.push(`命令：${this.#command() || '（未配置）'}`);
-    if (this.#busy) bits.push(`在途 ${this.#busy}`);
+    if (this.#current) bits.push(`正在播放 ${this.#current.id}`);
+    if (this.#pending.length) bits.push(`排队 ${this.#pending.length} 条`);
     if (this.#lastWatched) bits.push(`上次：${this.#lastWatched}`);
     return bits.join(' · ');
   }
@@ -278,8 +295,15 @@ export class AudioPlayWorld {
         if (!types.has(event.type)) continue;
         const ref = this.#audioRefOf(event);
         if (!ref) continue;
-        void this.#enqueue(() => this.#playWatched(event, ref))
-          .catch((err) => this.#host?.log?.warn?.('自动播放：后台任务异常', { err: msg(err) }));
+        this.#pending.push(this.#item({
+          ref: ref.ref,
+          fallbackPath: ref.temp && typeof event.meta?.path === 'string' ? event.meta.path.trim() : '',
+          origin: 'event',
+          type: event.type,
+          volume: this.#volume({}),
+          timeoutMs: this.#timeout(),
+        }));
+        this.#pump();
       }
     } catch (err) {
       this.#lastError = `${new Date().toISOString()} 读事件失败：${msg(err)}`;
@@ -297,69 +321,64 @@ export class AudioPlayWorld {
     return null;
   }
 
-  async #playWatched(event, ref) {
-    // 排队期间关掉监听、或 World 停了：这条不再播。
-    if (this.#stopped || !this.#bool('autoPlay')) return;
-    const volume = this.#volume({});
-    let audio;
-    try {
-      audio = this.#resolveAudio(ref.ref);
-    } catch (err) {
-      const fallback = ref.temp && typeof event.meta?.path === 'string' ? event.meta.path.trim() : '';
-      if (fallback) {
-        try {
-          audio = this.#resolveAudio(fallback);
-        } catch {
-          audio = null;
-        }
-      }
-      if (!audio) {
-        await this.#reportFailure(err, { origin: 'event', ref: ref.ref, type: event.type, volume });
-        return;
-      }
-    }
-    if (this.#stopped || !this.#bool('autoPlay')) {
-      if (audio.temp) this.#removeTemp(audio.path);
+  #item(fields) {
+    return {
+      id: `q${++this.#seq}`,
+      controller: new AbortController(),
+      startedAt: 0,
+      ...fields,
+    };
+  }
+
+  #shownOf(ref) {
+    const raw = asText(ref);
+    return /^(log|mem|file):/i.test(raw) ? raw : basename(raw);
+  }
+
+  #originSays(item) {
+    return item.origin === 'event' ? `事件 ${item.type ?? ''}`.trim() : '手动';
+  }
+
+  /** 同一时间只放一段；每条都有 id，可以跳、删、清。 */
+  #pump() {
+    if (this.#current) return;
+    if (this.#stopped) {
+      this.#settleIdle();
       return;
     }
-    const own = new AbortController();
-    this.#active.add(own);
-    this.#busy += 1;
-    try {
-      await this.playFile({
-        path: audio.path,
-        volume,
-        timeoutMs: this.#timeout(),
-        backend: this.#backend(),
-        command: this.#command(),
-        signal: own.signal,
-      });
-      this.#lastPlayedAt = new Date().toISOString();
-      this.#lastWatched = event.type;
-    } catch (err) {
-      await this.#reportFailure(err, { origin: 'event', ref: ref.ref, type: event.type, volume });
-    } finally {
-      this.#busy -= 1;
-      this.#active.delete(own);
-      if (audio.temp) this.#removeTemp(audio.path);
+    while (this.#pending.length) {
+      const item = this.#pending.shift();
+      if (item.cancelled || item.controller.signal.aborted || item.ctxSignal?.aborted) continue;
+      this.#current = item;
+      item.startedAt = Date.now();
+      this.#busy = 1;
+      const done = this.#runItem(item)
+        .catch((err) => {
+          this.#host?.log?.warn?.('音频播放：后台任务异常', { err: msg(err) });
+        })
+        .finally(() => {
+          if (this.#current === item) this.#current = null;
+          this.#busy = 0;
+          this.#running = null;
+          this.#pump();
+        });
+      this.#running = done;
+      void done;
+      return;
     }
+    this.#settleIdle();
   }
 
-  /** 同一时间只放一段；后到的调用排队，避免两段声音叠在一起。 */
-  #enqueue(task) {
-    this.#queued += 1;
-    const run = () => {
-      this.#queued -= 1;
-      return task();
-    };
-    const result = this.#tail.then(run, run);
-    this.#tail = result.then(() => {}, () => {});
-    return result;
+  #settleIdle() {
+    if (this.#current || this.#pending.length) return;
+    for (const done of this.#idleWaiters) done();
+    this.#idleWaiters.clear();
   }
 
-  /** 等当前队列（正在播放和排队中）全部结束；自检与 smoke 用。 */
+  /** 等队列（正在播放和排队中）全部结束；自检与 smoke 用。 */
   whenIdle() {
-    return this.#tail;
+    if (!this.#current && !this.#pending.length) return Promise.resolve();
+    return new Promise((resolve) => this.#idleWaiters.add(resolve));
   }
 
   #play(args, ctx) {
@@ -375,43 +394,134 @@ export class AudioPlayWorld {
     }
 
     const volume = this.#volume(args);
-    const timeoutMs = this.#timeout();
-    const own = new AbortController();
-    this.#active.add(own);
-    const signal = ctx?.signal ? AbortSignal.any([ctx.signal, own.signal]) : own.signal;
-    void this.#enqueue(() => this.#runPlay({ raw, volume, timeoutMs, signal, own }))
-      .catch((err) => this.#host?.log?.warn?.('音频播放：后台任务异常', { err: msg(err) }));
+    const item = this.#item({
+      ref: raw,
+      shown: this.#shownOf(raw),
+      volume,
+      origin: 'manual',
+      timeoutMs: this.#timeout(),
+      ctxSignal: ctx?.signal ?? null,
+    });
+    this.#pending.push(item);
+    const behind = Math.max(0, (this.#current ? 1 : 0) + this.#pending.length - 1);
+    this.#pump();
 
-    const behind = Math.max(0, this.#busy + this.#queued - 1);
-    const shown = /^(log|mem|file):/i.test(raw) ? raw : basename(raw);
-    const head = behind > 0 ? `已排队（前面还有 ${behind} 条）` : '开始播放';
-    return { text: `${head}：${shown}（音量 ${volume}）；放完不再回报，失败会以事件通知。` };
+    const head = behind > 0 ? `已排队（${item.id}，前面还有 ${behind} 条）` : `开始播放（${item.id}）`;
+    return { text: `${head}：${item.shown}（音量 ${volume}）；放完不再回报，失败会以事件通知。` };
   }
 
-  /** 后台播放：解析音频、等播放器结束、清临时文件；失败推事件。 */
-  async #runPlay({ raw, volume, timeoutMs, signal, own }) {
-    if (this.#stopped || signal.aborted) {
-      this.#active.delete(own);
-      return;
+  #queueSays() {
+    const lines = [];
+    const current = this.#current;
+    if (!current) {
+      lines.push('正在播放：（空）');
+    } else {
+      const elapsed = current.startedAt ? Math.max(0, Math.round((Date.now() - current.startedAt) / 1000)) : 0;
+      const shown = current.shown ?? this.#shownOf(current.ref);
+      lines.push(`正在播放：${current.id} ${shown}（音量 ${current.volume}，${this.#originSays(current)}，已 ${elapsed} 秒）`);
     }
+    if (!this.#pending.length) {
+      lines.push('排队：（空）');
+    } else {
+      lines.push(`排队 ${this.#pending.length} 条：`);
+      for (const item of this.#pending) {
+        const shown = item.shown ?? this.#shownOf(item.ref);
+        lines.push(`  ${item.id} ${shown}（音量 ${item.volume}，${this.#originSays(item)}）`);
+      }
+    }
+    return lines.join('\n');
+  }
+
+  #queueAction(args) {
+    const action = asText(args.action) || 'list';
+    const id = asText(args.id);
+    switch (action) {
+      case 'list':
+        return { text: this.#queueSays() };
+      case 'skip': {
+        if (!this.#current) {
+          const next = this.#pending.shift();
+          if (!next) return { text: '播放队列是空的，没有可跳过的。' };
+          next.cancelled = true;
+          next.controller.abort();
+          return { text: `已跳过 ${next.id}（${next.shown ?? this.#shownOf(next.ref)}）；队列里还有 ${this.#pending.length} 条。` };
+        }
+        const item = this.#current;
+        item.controller.abort();
+        const next = this.#pending[0];
+        return {
+          text: `已跳过 ${item.id}（${item.shown ?? this.#shownOf(item.ref)}）；${next ? `下一条 ${next.id} 接着放` : '队列里没有别的了'}。`,
+        };
+      }
+      case 'remove': {
+        if (!id) return { text: '[audio_queue 没执行] remove 需要 id，先用 action=list 看队列。', failed: true };
+        if (this.#current?.id === id) {
+          return { text: `[audio_queue 没执行] ${id} 正在播放，要停它用 skip。`, failed: true };
+        }
+        const index = this.#pending.findIndex((one) => one.id === id);
+        if (index < 0) return { text: `[audio_queue 没执行] 队列里没有 ${id}，先用 action=list 看一遍。`, failed: true };
+        const [removed] = this.#pending.splice(index, 1);
+        removed.cancelled = true;
+        removed.controller.abort();
+        return { text: `已从队列移除 ${removed.id}（${removed.shown ?? this.#shownOf(removed.ref)}）；队列里还有 ${this.#pending.length} 条。` };
+      }
+      case 'clear': {
+        const current = this.#current;
+        const dropped = this.#pending.length;
+        for (const one of this.#pending) {
+          one.cancelled = true;
+          one.controller.abort();
+        }
+        this.#pending = [];
+        current?.controller.abort();
+        const head = current ? `已停止 ${current.id}` : '没有正在播放的';
+        return { text: `${head}；清空排队 ${dropped} 条。` };
+      }
+      default:
+        return { text: '[audio_queue 没执行] action 只能是 list、skip、remove 或 clear。', failed: true };
+    }
+  }
+
+  /** 后台播放一条：解析音频、等播放器结束、清临时文件；失败推事件。 */
+  async #runItem(item) {
+    const signal = item.ctxSignal
+      ? AbortSignal.any([item.ctxSignal, item.controller.signal])
+      : item.controller.signal;
     let audio = null;
-    this.#busy += 1;
     try {
-      audio = this.#resolveAudio(raw);
+      if (this.#stopped || signal.aborted) return;
+      if (item.origin === 'event' && !this.#bool('autoPlay')) return;
+      try {
+        audio = this.#resolveAudio(item.ref);
+      } catch (err) {
+        let fallback = null;
+        if (item.fallbackPath) {
+          try {
+            fallback = this.#resolveAudio(item.fallbackPath);
+          } catch {
+            fallback = null;
+          }
+        }
+        if (!fallback) {
+          await this.#reportFailure(err, item);
+          return;
+        }
+        audio = fallback;
+      }
+      if (this.#stopped || signal.aborted) return;
       await this.playFile({
         path: audio.path,
-        volume,
-        timeoutMs,
+        volume: item.volume,
+        timeoutMs: item.timeoutMs,
         backend: this.#backend(),
         command: this.#command(),
         signal,
       });
       this.#lastPlayedAt = new Date().toISOString();
+      if (item.origin === 'event') this.#lastWatched = item.type;
     } catch (err) {
-      await this.#reportFailure(err, { origin: 'manual', ref: raw, volume });
+      await this.#reportFailure(err, item);
     } finally {
-      this.#busy -= 1;
-      this.#active.delete(own);
       if (audio?.temp) this.#removeTemp(audio.path);
     }
   }
@@ -591,7 +701,9 @@ export class AudioPlayWorld {
       supported: supportedPlatform(process.platform),
       tempDir: this.tempDir(),
       busy: this.#busy > 0,
-      queued: this.#queued,
+      queued: this.#pending.length,
+      current: this.#current?.id ?? '',
+      currentRef: this.#current?.shown ?? '',
       volume: Math.round(this.#num('volume', 0, 100)),
       timeoutMs: this.#timeout(),
       lastError: this.#lastError,
@@ -639,6 +751,9 @@ export class AudioPlayWorld {
   async start(host) {
     this.#host = host;
     this.#stopped = false;
+    this.#pending = [];
+    this.#current = null;
+    this.#running = null;
     if (this.#timer) clearInterval(this.#timer);
     this.#watchCursor = host.store.latestCursor();
     this.#timer = setInterval(() => this.#scanWatched(), this.#scanMs);
@@ -666,10 +781,29 @@ export class AudioPlayWorld {
       clearInterval(this.#timer);
       this.#timer = null;
     }
-    for (const own of this.#active) own.abort();
-    this.#active.clear();
-    // 让排队中的任务跑完（它们看到 stopped 就直接返回），顺带清掉临时文件。
-    await this.#tail;
+    const dropped = this.#pending.length;
+    for (const item of this.#pending) {
+      item.cancelled = true;
+      item.controller.abort();
+    }
+    this.#pending = [];
+    const current = this.#current;
+    current?.controller.abort();
+    const running = this.#running;
+    if (running) {
+      try {
+        await running;
+      } catch {
+        /* 后台任务自己会记日志。 */
+      }
+    }
+    this.#current = null;
+    this.#busy = 0;
+    this.#running = null;
+    this.#settleIdle();
+    if (current || dropped) {
+      this.#host?.log?.info?.('音频播放已停止', { droppedQueued: dropped, stoppedCurrent: current?.id ?? '' });
+    }
     this.#host = null;
   }
 }

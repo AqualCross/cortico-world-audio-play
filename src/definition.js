@@ -18,6 +18,10 @@ const TOOL_SUMMARIES = {
     zh: '打开或关闭事件音频的自动播放，更换监听的事件类型或播放后端，或查看当前设置；播放新事件里的音频附件。',
     en: 'Turn automatic playback of event audio on or off, change the watched event types or the playback backend, or read the current settings; plays audio attachments on new events.',
   },
+  audio_queue: {
+    zh: '查看或调整播放队列：列表、跳过当前这条、按 id 移除排队中的一条、停止当前并清空队列；跳过和清空是取消，不算失败，不发失败事件。',
+    en: 'Read or change the playback queue: list, skip the current item, remove a waiting item by id, or stop the current item and clear the queue; skipping and clearing are cancellations, not failures, so no failure event is sent.',
+  },
 };
 
 /** 与框架 `describeTools()` 相同的拼法：取发给模型的字段，再加一句 summary。 */

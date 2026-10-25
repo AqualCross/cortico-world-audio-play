@@ -76,6 +76,39 @@
         "zh": "打开或关闭事件音频的自动播放，更换监听的事件类型或播放后端，或查看当前设置；播放新事件里的音频附件。",
         "en": "Turn automatic playback of event audio on or off, change the watched event types or the playback backend, or read the current settings; plays audio attachments on new events."
       }
+    },
+    {
+      "name": "audio_queue",
+      "description": "Read or change the playback queue. list shows what is playing now and what is waiting; skip stops the current item and lets the next one start; remove drops one waiting item by id; clear stops the current item and drops everything waiting. Skipping and clearing are cancellations, not failures: no audio-play.failed event is sent. Manual plays and watched event audio share one queue; ids come from an audio_play receipt or from list.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "list",
+              "skip",
+              "remove",
+              "clear"
+            ],
+            "description": "list = current item and waiting items; skip = stop the current item; remove = drop one waiting item; clear = stop the current item and drop all waiting items."
+          },
+          "id": {
+            "type": "string",
+            "description": "For remove: the queue id to drop, e.g. q7. The current item cannot be removed; use skip."
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "tags": [
+        "act"
+      ],
+      "summary": {
+        "zh": "查看或调整播放队列：列表、跳过当前这条、按 id 移除排队中的一条、停止当前并清空队列；跳过和清空是取消，不算失败，不发失败事件。",
+        "en": "Read or change the playback queue: list, skip the current item, remove a waiting item by id, or stop the current item and clear the queue; skipping and clearing are cancellations, not failures, so no failure event is sent."
+      }
     }
   ],
   "events": [
@@ -86,6 +119,14 @@
         "en": "A failed playback: the text carries the audio reference, volume and reason, with no attachment; both manual and watched playback emit it, success is silent."
       },
       "trigger": "debounce"
+    }
+  ],
+  "prompts": [
+    {
+      "key": "worlds.audio-play.env",
+      "title": "提示词",
+      "role": "envPrompt",
+      "content": ""
     }
   ]
 }

@@ -165,13 +165,35 @@ try {
   });
 
   check('describe 与 describe.json 一致，实例工具都在声明里', () => {
-    assert(def.describe && Array.isArray(def.describe.tools) && def.describe.tools.length === 2, '定义缺 describe.tools');
+    assert(def.describe && Array.isArray(def.describe.tools) && def.describe.tools.length === 3, '定义缺 describe.tools');
     assert(Array.isArray(def.describe.events), '定义缺 describe.events');
     const file = JSON.parse(readFileSync(join(pkgDir, 'describe.json'), 'utf8'));
-    eq(stable(file), stable(JSON.parse(JSON.stringify(def.describe))), 'describe.json 与代码里的 describe 不一致');
+    const world = makeWorld();
+    const docs = (world.webUi('zh').promptDocs ?? []).filter((doc) => doc.role === 'envPrompt');
+    const prompts = [];
+    const seen = new Set();
+    for (const doc of docs) {
+      if (seen.has(doc.key) || !existsSync(doc.path)) continue;
+      seen.add(doc.key);
+      prompts.push({
+        key: doc.key,
+        title: doc.title,
+        ...(doc.role ? { role: doc.role } : {}),
+        content: readFileSync(doc.path, 'utf8'),
+      });
+    }
+    const expected = {
+      tools: def.describe.tools,
+      events: def.describe.events,
+      ...(prompts.length ? { prompts } : {}),
+    };
+    eq(stable(file), stable(JSON.parse(JSON.stringify(expected))), 'describe.json 与代码里的 describe 不一致');
     eq(file.tools[0].name, 'audio_play', 'describe 工具名');
     eq(file.events.length, 1, '失败事件应当在自描述里');
     eq(file.events[0].type, mod.AUDIO_PLAY_FAILED_EVENT, 'describe 事件名');
+    eq(file.prompts?.length, 1, '自描述应当带上环境提示词');
+    eq(file.prompts[0].key, 'worlds.audio-play.env', '提示词 key');
+    eq(file.prompts[0].content, readFileSync(join(pkgDir, 'src', 'ENV_PROMPT.md'), 'utf8'), '提示词原文');
     const names = new Set(file.tools.map((t) => t.name));
     for (const tool of makeWorld().tools()) assert(names.has(tool.name), `工具 ${tool.name} 不在 describe.tools 里`);
   });
@@ -214,10 +236,10 @@ try {
   // -------------------------------------------------------------------------
   console.log('World 与工具');
 
-  check('audio_play 与 audio_watch，声明齐全', () => {
+  check('audio_play、audio_watch 与 audio_queue，声明齐全', () => {
     const world = makeWorld();
     const tools = world.tools();
-    eq(tools.length, 2, '工具数量');
+    eq(tools.length, 3, '工具数量');
     const tool = tools[0];
     eq(tool.name, 'audio_play', '工具名');
     assert(Array.isArray(tool.tags) && tool.tags.includes('act'), 'tags');
@@ -229,6 +251,11 @@ try {
     eq(watch.name, 'audio_watch', '监听工具名');
     eq(watch.parameters.required?.[0], 'action', 'watch required[0]');
     assert(watch.parameters.properties?.events, '缺 events 参数');
+    const queue = tools[2];
+    eq(queue.name, 'audio_queue', '队列工具名');
+    eq(queue.parameters.required?.[0], 'action', 'queue required[0]');
+    eq(queue.parameters.properties?.action?.enum.join(','), 'list,skip,remove,clear', '队列动作');
+    assert(queue.parameters.properties?.id, '缺 id 参数');
   });
 
   check('播放器工具函数与平台声明', () => {
@@ -529,6 +556,119 @@ try {
     await world.whenIdle();
     eq(maxActive, 1, '不该并发播放');
     eq(order.join(','), 'start:one,end:one,start:two,end:two', '顺序不对');
+  });
+
+  await checkAsync('队列项有 id，list 展示当前与排队，remove 只删排队项', async () => {
+    const one = writeFile(join(scratch, 'queue-one.wav'));
+    const two = writeFile(join(scratch, 'queue-two.wav'));
+    const three = writeFile(join(scratch, 'queue-three.wav'));
+    let release = null;
+    const world = makeWorld({}, {
+      play: ({ path }) => new Promise((resolve) => {
+        if (path.endsWith('queue-one.wav')) release = () => resolve({ backend: 'fake' });
+        else resolve({ backend: 'fake' });
+      }),
+    });
+    const [play, , queue] = world.tools();
+    const a = await play.handler({ audio: one }, {});
+    const b = await play.handler({ audio: two }, {});
+    const c = await play.handler({ audio: three }, {});
+    assert(a.text.includes('开始播放（q1）'), a.text);
+    assert(b.text.includes('已排队（q2，前面还有 1 条）'), b.text);
+    assert(c.text.includes('q3，前面还有 2 条'), c.text);
+
+    const listed = await queue.handler({ action: 'list' }, {});
+    for (const id of ['q1', 'q2', 'q3']) assert(listed.text.includes(id), listed.text);
+    assert(listed.text.includes('排队 2 条'), listed.text);
+    assert(listed.text.includes('正在播放：q1'), listed.text);
+
+    const removed = await queue.handler({ action: 'remove', id: 'q2' }, {});
+    assert(!removed.failed, removed.text);
+    assert(!(await queue.handler({ action: 'list' }, {})).text.includes('q2'), 'q2 应当已移除');
+    const current = await queue.handler({ action: 'remove', id: 'q1' }, {});
+    assert(current.failed && current.text.includes('skip'), current.text);
+    const missing = await queue.handler({ action: 'remove', id: 'q9' }, {});
+    assert(missing.failed, '未知 id 应当失败');
+    const noId = await queue.handler({ action: 'remove' }, {});
+    assert(noId.failed, 'remove 缺 id 应当失败');
+    const badAction = await queue.handler({ action: 'nope' }, {});
+    assert(badAction.failed, '未知 action 应当失败');
+
+    release();
+    await world.whenIdle();
+    eq(world.__calls.length, 2, 'q1 与 q3 各播一次');
+    assert(world.__calls[1].path.endsWith('queue-three.wav'), 'q3 应当接着播');
+  });
+
+  await checkAsync('skip 中止当前并从下一条接着放，取消不发失败事件', async () => {
+    const one = writeFile(join(scratch, 'skip-one.wav'));
+    const two = writeFile(join(scratch, 'skip-two.wav'));
+    const host = fakeHost();
+    const started = [];
+    const world = makeWorld({}, {
+      play: ({ path, signal }) => new Promise((resolve, reject) => {
+        started.push(path.endsWith('skip-one.wav') ? 'one' : 'two');
+        if (path.endsWith('skip-two.wav')) {
+          resolve({ backend: 'fake' });
+          return;
+        }
+        const stop = () => reject(new player.PlaybackError('aborted', '播放被取消。'));
+        if (signal.aborted) {
+          stop();
+          return;
+        }
+        signal.addEventListener('abort', stop, { once: true });
+      }),
+    });
+    await world.start(host);
+    const [play, , queue] = world.tools();
+    await play.handler({ audio: one }, {});
+    await play.handler({ audio: two }, {});
+    const skipped = await queue.handler({ action: 'skip' }, {});
+    assert(!skipped.failed, skipped.text);
+    assert(skipped.text.includes('q1'), skipped.text);
+    await world.whenIdle();
+    eq(started.join(','), 'one,two', '第二条应当接着放');
+    eq(host.pushed.length, 0, '跳过不该发失败事件');
+    const empty = await queue.handler({ action: 'skip' }, {});
+    assert(!empty.failed && empty.text.includes('空的'), empty.text);
+    await world.stop();
+  });
+
+  await checkAsync('clear 停止当前并清空排队，取消不发失败事件', async () => {
+    const one = writeFile(join(scratch, 'clear-one.wav'));
+    const two = writeFile(join(scratch, 'clear-two.wav'));
+    const three = writeFile(join(scratch, 'clear-three.wav'));
+    const host = fakeHost();
+    const started = [];
+    const world = makeWorld({}, {
+      play: ({ path, signal }) => new Promise((resolve, reject) => {
+        started.push(path);
+        if (!path.endsWith('clear-one.wav')) {
+          resolve({ backend: 'fake' });
+          return;
+        }
+        const stop = () => reject(new player.PlaybackError('aborted', '播放被取消。'));
+        if (signal.aborted) {
+          stop();
+          return;
+        }
+        signal.addEventListener('abort', stop, { once: true });
+      }),
+    });
+    await world.start(host);
+    const [play, , queue] = world.tools();
+    await play.handler({ audio: one }, {});
+    await play.handler({ audio: two }, {});
+    await play.handler({ audio: three }, {});
+    const cleared = await queue.handler({ action: 'clear' }, {});
+    assert(!cleared.failed, cleared.text);
+    await world.whenIdle();
+    eq(started.length, 1, '排队的两条不该开始');
+    eq(host.pushed.length, 0, '清空不该发失败事件');
+    const listed = await queue.handler({ action: 'list' }, {});
+    assert(listed.text.includes('正在播放：（空）') && listed.text.includes('排队：（空）'), listed.text);
+    await world.stop();
   });
 
   await checkAsync('中断信号会取消后台播放，取消不算失败事件', async () => {

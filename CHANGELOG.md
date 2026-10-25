@@ -2,6 +2,14 @@
 
 每个版本一节 `## <版本号>`；扩展市场按节显示更新说明。
 
+## 0.3.0
+
+- 新增 `audio_queue`：`list` 查看当前与排队条目，`skip` 跳过当前这条，`remove` 按 id 删掉排队中的一条，`clear` 停止当前并清空队列。
+- 队列从 promise 链改成显式条目，每条有 id；`audio_play` 回执带上 id（`q7`）与前面还有几条。
+- 跳过和清空是取消：停掉播放器进程，不发 `audio-play.failed`。
+- 手动播放与事件自动播放共用同一个队列，事件音频也能跳掉；`audio_watch status` 显示当前条目与队列深度。
+- 队列只在内存里，重启应用不保留。
+
 ## 0.2.0
 
 - 新增 `worlds.audio-play.backend`：选择播放后端。`auto` 保持平台默认，也可以指定 `wpf` / `ffplay` / `mpv` / `vlc` / `afplay` / `paplay` / `aplay`，或用 `custom`。
